@@ -3,6 +3,14 @@
 Each version's section is its release notes, and what the update window shows.
 Releases are cut as described in [docs/releasing.md](docs/releasing.md).
 
+## 0.1.19-remote-ssh.1
+
+- Fork preview with Remote SSH: create and manage Agents on your own SSH host. Their harness, chat connections, credentials and data stay on that host, and they continue running when the managing computer disconnects.
+- Choose aliases from local `~/.ssh/config`, or enter a host manually. **Install and connect** installs a private Node.js 24/npm runtime over SSH and prepares Mingle automatically, with progress, retry and recovery when progress cannot be read.
+- Requires SSH key access and prior host trust. Harness installation/sign-in and remote boot startup remain separate. Real-host SSH integration has not been verified; this preview passed isolated tests.
+- macOS preview for Apple Silicon and Intel. The app uses ad hoc signing, without Apple notarization. On first launch, allow it in **System Settings → Privacy & Security** if macOS blocks it.
+- This build uses the `gerayking/Mingle` fork and its own update-signing key. It is not an upstream Mingle release.
+
 ## 0.1.19
 
 - An installed agent app no longer flickers between "installed" and "not installed". Checking whether a harness such as CodeBuddy is installed launches several probes at once — especially slow on Windows, where each probe starts a `.cmd` shim and Node — and a single timed-out probe used to replace the earlier answer, so the harness picker and the install status in Settings could lose a working harness. Mingle now remembers where each harness was last found, keeps it while the program is still on disk, and only reports "not installed" when the program ran and refused or its file is gone. The picker and Settings also share one probe instead of running their own at the same time, and starting a session trusts the remembered copy, so one missed probe can no longer fail with "not installed".

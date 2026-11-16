@@ -64,3 +64,10 @@
 Developer ID 证书需要加入付费的 Apple Developer Program（每年 99 美元）才能申请。装了 Xcode 但只用免费账号，只能拿到 "Apple Development" 证书，它不能用于对外分发。
 
 `MYGO_UPDATER_PRIVATE_KEY` 是给自动更新签名的私钥，已经配置好。它决定谁能给所有已安装的 Mingle 推送更新：不要轮换，也不要外传。
+
+### Remote SSH fork 预览版
+
+`codex/remote-ssh-release` 从 Remote SSH 功能分支创建，用于 `gerayking/Mingle` 的
+`v0.1.19-remote-ssh.1` 预览版。沿用测试标签流程，只发布 macOS arm64/amd64 安装包，
+采用 ad hoc 签名且不做 Apple 公证。该分支的更新来源和公钥属于 fork，私钥保存在
+fork 的 `MYGO_UPDATER_PRIVATE_KEY` Actions secret；不使用上游的签名私钥。

@@ -16,8 +16,8 @@ export default {
   license: "MIT",
   out: "build",
   updates: {
-    publicKey: "sPkcU9YfvgSNIpGsaSHyvJgx+Tf/jCRJpjOdlzHIOGM=",
-    github: "earayu/Mingle",
+    publicKey: "SfDFoINngNbGVgumpO+jFQ1c0kOFhQxy2UzEOCiVi/o=",
+    github: "gerayking/Mingle",
     // Release notes for the update window: the version's section of the root changelog.
     changelog: "../CHANGELOG.md",
   },
