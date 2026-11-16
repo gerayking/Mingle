@@ -20,7 +20,8 @@ import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/pr
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const REPOSITORY = "earayu/Mingle";
+export const REPOSITORY = process.env.MINGLE_RELEASE_REPOSITORY ?? "earayu/Mingle";
+if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(REPOSITORY)) throw new Error("Invalid release repository");
 export const REPO_URL = `https://github.com/${REPOSITORY}`;
 
 export interface ReleaseAsset {

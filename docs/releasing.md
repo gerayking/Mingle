@@ -71,3 +71,6 @@ Developer ID 证书需要加入付费的 Apple Developer Program（每年 99 美
 `v0.1.19-remote-ssh.1` 预览版。沿用测试标签流程，只发布 macOS arm64/amd64 安装包，
 采用 ad hoc 签名且不做 Apple 公证。该分支的更新来源和公钥属于 fork，私钥保存在
 fork 的 `MYGO_UPDATER_PRIVATE_KEY` Actions secret；不使用上游的签名私钥。
+校验 fork 产物时设置 `MINGLE_RELEASE_REPOSITORY=gerayking/Mingle`，校验器仍严格核对
+资产和更新清单属于该仓库。未设置时沿用上游仓库。Runner 长时间排队时，可在本机
+从发布标签构建两种 macOS 产物，取消云端任务后按 assemble、smoke、verify 流程发布。
