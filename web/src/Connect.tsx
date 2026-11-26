@@ -5,6 +5,7 @@ import {
   api,
   type CredentialField,
   type OnboardingState,
+  type PermissionId,
   type Platform,
   type PlatformInfo,
   type SetupCheckState,
@@ -46,7 +47,11 @@ export function ConnectPage({
   onChanged: () => void;
 }) {
   const { t } = useI18n();
-  const { value: platforms } = useCached<PlatformInfo[]>("platforms", api.platforms, []);
+  const { value: platforms } = useCached<PlatformInfo[]>(
+    `platforms:${agent.remote?.id ?? "local"}`,
+    () => api.platforms(agent.remote?.id),
+    [],
+  );
 
   const info = platforms?.find((p) => p.platform === platform);
   const back = () =>
@@ -76,7 +81,13 @@ export function ConnectPage({
               <Spinner /> {t("qr.loading")}
             </p>
           ) : info?.onboarding ? (
-            <PlatformFlow key={info.platform} agent={agent} info={info} onDone={done} />
+            <PlatformFlow
+              key={info.platform}
+              agent={agent}
+              info={info}
+              onDone={done}
+              {...(!agent.remote ? { onProxySettings: () => onNavigate({ kind: "settings", focus: "network" }) } : {})}
+            />
           ) : (
             <PlatformGrid
               agent={agent}
@@ -148,7 +159,17 @@ function PlatformGrid({
   );
 }
 
-function PlatformFlow({ agent, info, onDone }: { agent: AgentView; info: PlatformInfo; onDone: () => void }) {
+function PlatformFlow({
+  agent,
+  info,
+  onDone,
+  onProxySettings,
+}: {
+  agent: AgentView;
+  info: PlatformInfo;
+  onDone: () => void;
+  onProxySettings?: () => void;
+}) {
   const [manual, setManual] = useState(false);
   if (info.setup) return <SetupFlow agent={agent} info={info} onDone={onDone} />;
   if (info.onboarding?.kind === "credentials") {
@@ -160,6 +181,7 @@ function PlatformFlow({ agent, info, onDone }: { agent: AgentView; info: Platfor
         stepsKey={`${info.platform}.steps` as MessageKey}
         {...(info.onboarding.setupUrl ? { setupUrl: withAgentName(info.onboarding.setupUrl, agent.name) } : {})}
         onDone={onDone}
+        {...(onProxySettings ? { onProxySettings } : {})}
       />
     );
   }
@@ -178,11 +200,20 @@ function PlatformFlow({ agent, info, onDone }: { agent: AgentView; info: Platfor
           : { setupLabelKey: "connect.openConsole" as MessageKey })}
         onDone={onDone}
         onBack={() => setManual(false)}
+        {...(onProxySettings ? { onProxySettings } : {})}
       />
     );
   }
   if (info.onboarding?.kind === "device") {
-    return <DeviceFlow agent={agent} info={info} onDone={onDone} onManual={() => setManual(true)} />;
+    return (
+      <DeviceFlow
+        agent={agent}
+        info={info}
+        onDone={onDone}
+        onManual={() => setManual(true)}
+        {...(onProxySettings ? { onProxySettings } : {})}
+      />
+    );
   }
   return (
     <QrFlow
@@ -190,6 +221,7 @@ function PlatformFlow({ agent, info, onDone }: { agent: AgentView; info: Platfor
       info={info}
       onDone={onDone}
       {...(info.manualFields.length ? { onManual: () => setManual(true) } : {})}
+      {...(onProxySettings ? { onProxySettings } : {})}
     />
   );
 }
@@ -221,6 +253,7 @@ function CredentialsFlow({
   backKey,
   onDone,
   onBack,
+  onProxySettings,
 }: {
   agent: AgentView;
   info: PlatformInfo;
@@ -231,11 +264,12 @@ function CredentialsFlow({
   backKey?: MessageKey;
   onDone: () => void;
   onBack?: () => void;
+  onProxySettings?: () => void;
 }) {
   const { t } = useI18n();
   const [values, setValues] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ text: string; network: boolean } | null>(null);
   const [connected, setConnected] = useState(false);
   const [bot, setBot] = useState<string | null>(null);
   /** What was last sent automatically, so a failed token is not sent again until it changes. */
@@ -256,7 +290,8 @@ function CredentialsFlow({
         // A platform with something to say once connected (where to try it) leaves time to read it.
         setTimeout(onDone, doneText ? 4000 : 900);
       } catch (e) {
-        setError(errorText(t, e));
+        const code = (e as { code?: string }).code;
+        setError({ text: errorText(t, e), network: code === "onboarding_network" || code === "network" });
       } finally {
         setBusy(false);
       }
@@ -325,7 +360,22 @@ function CredentialsFlow({
                 </Field>
               );
             })}
-            {error ? <Problem title={t("connect.failed")}>{error}</Problem> : null}
+            {error ? (
+              <Problem title={t("connect.failed")} tone={error.network ? "red" : "amber"}>
+                {error.text}
+                {error.network && onProxySettings ? (
+                  <div className="mt-1.5">
+                    <button
+                      type="button"
+                      onClick={onProxySettings}
+                      className="text-small font-medium text-accent hover:underline"
+                    >
+                      {t("proxy.checkSettings")} →
+                    </button>
+                  </div>
+                ) : null}
+              </Problem>
+            ) : null}
             <div className="flex items-center gap-2">
               <Button type="submit" variant="primary" disabled={busy || !filled}>
                 {busy ? (
@@ -394,15 +444,15 @@ function SetupFlow({ agent, info, onDone }: { agent: AgentView; info: PlatformIn
   const [connected, setConnected] = useState(false);
 
   const refresh = useCallback(async () => {
-    const next = await api.setup(platform).catch(() => null);
+    const next = await api.setup(platform, agent.remote?.id).catch(() => null);
     if (next) setSetup(next);
-  }, [platform]);
+  }, [platform, agent.remote?.id]);
   usePolling(refresh, 2000, !connected);
 
   const act = async (action: string) => {
     setActing(action);
     try {
-      setSetup(await api.setupAction(platform, action));
+      setSetup(await api.setupAction(platform, action, agent.remote?.id));
     } catch (e) {
       setError(errorText(t, e));
     } finally {
@@ -575,11 +625,13 @@ function DeviceFlow({
   info,
   onDone,
   onManual,
+  onProxySettings,
 }: {
   agent: AgentView;
   info: PlatformInfo;
   onDone: () => void;
   onManual: () => void;
+  onProxySettings?: () => void;
 }) {
   const { t } = useI18n();
   const platform = info.platform;
@@ -653,6 +705,17 @@ function DeviceFlow({
             <div className="flex flex-col gap-2">
               <Problem title={t("connect.failed")} tone="red">
                 {errorTextFor(t, state.code)}
+                {state.code === "network" && onProxySettings ? (
+                  <div className="mt-1.5">
+                    <button
+                      type="button"
+                      onClick={onProxySettings}
+                      className="text-small font-medium text-accent hover:underline"
+                    >
+                      {t("proxy.checkSettings")} →
+                    </button>
+                  </div>
+                ) : null}
               </Problem>
               <Button className="self-start" onClick={restart}>
                 {t("connect.retry")}
@@ -686,6 +749,7 @@ function useOnboarding(
   platform: Platform,
   update: string | undefined,
   onState?: (state: OnboardingState) => void,
+  adding?: readonly PermissionId[],
 ) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [state, setState] = useState<OnboardingState>({ state: "starting" });
@@ -700,7 +764,7 @@ function useOnboarding(
     let stopped = false;
     setState({ state: "starting" });
     api
-      .startOnboarding(agentId, platform, update)
+      .startOnboarding(agentId, platform, update, adding)
       .then((r) => {
         id = r.id;
         if (stopped) api.cancelOnboarding(r.id).catch(() => {});
@@ -755,20 +819,31 @@ export function QrFlow({
   agent,
   info,
   update,
+  adding,
   onDone,
   onManual,
+  onProxySettings,
 }: {
   agent: AgentView;
   info: PlatformInfo;
   /** Connection id when re-authorizing an already-connected bot (Channel.reauthorize). */
   update?: string;
+  /** Optional permissions to turn on with that re-authorization. */
+  adding?: readonly PermissionId[];
   onDone: () => void;
   onManual?: () => void;
+  onProxySettings?: () => void;
 }) {
   const { t } = useI18n();
-  const { sessionId, state, now, restart } = useOnboarding(agent.id, info.platform, update, (next) => {
-    if (next.state === "done") setTimeout(onDone, next.pendingApproval ? 2500 : 1200);
-  });
+  const { sessionId, state, now, restart } = useOnboarding(
+    agent.id,
+    info.platform,
+    update,
+    (next) => {
+      if (next.state === "done") setTimeout(onDone, next.pendingApproval ? 2500 : 1200);
+    },
+    adding,
+  );
   const platformName = t(`platform.${info.platform}` as MessageKey);
   // Scanning with another account adds a bot; the ones already here keep working.
   const existing = agent.connections.filter((c) => c.platform === info.platform).length;
@@ -827,6 +902,17 @@ export function QrFlow({
               {s === "failed" && !expired ? (
                 <Problem title={t("connect.failed")} tone="red">
                   {errorTextFor(t, state.state === "failed" ? state.code : "unknown")}
+                  {state.state === "failed" && state.code === "network" && onProxySettings ? (
+                    <div className="mt-1.5">
+                      <button
+                        type="button"
+                        onClick={onProxySettings}
+                        className="text-small font-medium text-accent hover:underline"
+                      >
+                        {t("proxy.checkSettings")} →
+                      </button>
+                    </div>
+                  ) : null}
                 </Problem>
               ) : expired ? (
                 <p className="text-small text-ink2">{t("qr.expired")}</p>

@@ -19,6 +19,7 @@ M3 进行中，进度见 `docs/spec.md` 11.1–11.3。已实现：存储、Agent
 - `src/core/mingle.ts`：整个进程的装配，收消息（inbox）、连接管理、提醒触发
 - `src/core/runtime.ts`：每个 Agent 的会话与消息投递，`docs/spec.md` 4.1–4.3 的实现
 - `src/core/outbox.ts`：所有对外发送
+- `src/core/lines.ts`：同时做几件事（`docs/spec.md` 4.13）：每件事一个会话、最多 3 条、排队与恢复
 - `src/core/inbound.ts`：入站消息状态机，所有状态写入经 `Store.moveInbound`（`docs/spec.md` 4.10）
 - `src/api/server.ts`：本地 HTTP API，`/v1/agent/*` 给 CLI，`/v1/admin/*` 给 owner
 - `src/cli/main.ts`：`mingle` 命令；`src/cli/manual.md` 是注入给 harness 的指南
@@ -91,6 +92,7 @@ docs/           文档
 
 - 目前直接提交到 `main`。提交前 `pnpm check` 必须通过。
 - 提交信息用英文，祈使句，说明做了什么和原因。
+- `README.md` 和 `README_CN.md` 内容保持一致，改一份就同步另一份。
 - 设计文档用中文；代码、标识符、注释、提交信息、CLI 输出、`src/cli/manual.md`、`README.md` 用英文。
 - 提交前确认不包含任何凭据、token 或个人数据。
 
@@ -107,6 +109,7 @@ pnpm build        # 先构建控制台（web/dist），再编译到 dist/
 pnpm dev:web      # 控制台热更新开发，API 代理到正在运行的 mingle start
 pnpm ui:review    # 先 pnpm build。用长名字、长文本和所有状态，在多个宽度 × 中英文下截图到 .ui-review/
 MINGLE_E2E=claude,codex pnpm vitest run test/e2e.test.ts   # 用本机真实 harness 跑端到端，会消耗额度；条目可写 id:model 指定模型，长用例只给 MINGLE_E2E_DEEP（默认 claude,codex）跑
+MINGLE_E2E_LINES=claude pnpm vitest run test/e2e-lines.test.ts   # 真实 harness 是否把长活交给线（4.13），结果写到 e2e-lines-*.log；MINGLE_E2E_LINES_ASKS 选请求，MINGLE_E2E_LINES_ROUNDS 重复次数
 node scripts/package-smoke.mjs <安装包>   # 解包安装产物，验证内置 node 能跑 mingle --version 和 start（release.yml 的 smoke 作业在用）
 node scripts/im-smoke-check.mjs           # 检查运行中的 Mingle 有没有"收到未回复"的消息（配合 docs/im-smoke.md 的真机冒烟）
 pnpm desktop:build  # 构建桌面应用到 desktop/build/（需要 Go，go.mod 指定的版本会自动下载）

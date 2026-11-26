@@ -18,6 +18,7 @@ import type {
   SendResult,
 } from "../channel.ts";
 import { withTextSent } from "../channel.ts";
+import { type Mention, renderMentions } from "../mention.ts";
 
 /**
  * Slack through Socket Mode: the app opens a WebSocket to Slack, so no public address is
@@ -57,6 +58,7 @@ const CAPABILITIES: Capabilities = {
   fileUpload: true,
   fileDownload: true,
   listMembers: false,
+  mentions: true,
   // A markdown block holds 12,000 characters.
   maxTextLength: 11_000,
 };
@@ -89,6 +91,8 @@ const MANIFEST = {
         "files:read",
         "files:write",
         "users:read",
+        // Slack rejects a manifest that declares slash commands without this scope.
+        "commands",
       ],
     },
   },
@@ -189,6 +193,7 @@ export function slackChannel(options: SlackOptions = {}): Channel {
 
   return {
     platform: "slack",
+    groupMessages: true,
     // Only people in the organization can message the bot or add it to a group.
     trust: "org",
     onboarding: {
@@ -341,12 +346,14 @@ export function slackChannel(options: SlackOptions = {}): Channel {
       };
       await open();
 
-      const post = async (chat: ChatRef, text: string, replyTo?: string) => {
+      const post = async (chat: ChatRef, text: string, replyTo?: string, broadcast = false) => {
         const { channel, thread } = parseChat(chat.platformId);
         const threadTs = thread ?? (chat.kind === "group" ? replyTo : undefined);
         const sent = await call<{ ts: string }>("chat.postMessage", {
           channel,
           ...(threadTs ? { thread_ts: threadTs } : {}),
+          // "Also send to channel": a line's result shows in the channel too (docs/spec.md 4.13).
+          ...(threadTs && broadcast ? { reply_broadcast: true } : {}),
           ...content(text),
         });
         if (threadTs) threads.add(`${channel}:${threadTs}`);
@@ -365,7 +372,13 @@ export function slackChannel(options: SlackOptions = {}): Channel {
             // Bytes first: a file Slack refuses must not leave the text behind on its own.
             const staged: Staged[] = [];
             for (const file of message.files ?? []) staged.push(await stageUpload(call, fetchImpl, file));
-            if (message.text.trim()) ts = await post(message.chat, message.text, message.replyTo);
+            if (message.text.trim())
+              ts = await post(
+                message.chat,
+                slackMentions(message.text, message.mentions),
+                message.replyTo,
+                message.inChat === true,
+              );
             if (staged.length) {
               await call("files.completeUploadExternal", {
                 files: staged,
@@ -401,9 +414,11 @@ export function slackChannel(options: SlackOptions = {}): Channel {
               last = markdown;
               await edit(markdown).catch(() => {});
             },
-            finish: async (markdown) => {
+            finish: async (markdown, mentions) => {
               try {
-                await edit(live.mention ? `<@${live.mention}> ${markdown}` : markdown);
+                const text = slackMentions(markdown, mentions);
+                const named = mentions?.some((m) => m.id === live.mention);
+                await edit(live.mention && !named ? `<@${live.mention}> ${text}` : text);
                 return { kind: "sent", platformId: ts };
               } catch (error) {
                 return sendFailure(error);
@@ -427,9 +442,15 @@ export function slackChannel(options: SlackOptions = {}): Channel {
           await writeFile(toPath, Buffer.from(await response.arrayBuffer()));
         },
 
+        async openDirect(userId: string) {
+          const { channel } = await call<{ channel: { id: string } }>("conversations.open", { users: userId });
+          return channel.id;
+        },
+
         async messageUser(userId: string, text: string) {
           const { channel } = await call<{ channel: { id: string } }>("conversations.open", { users: userId });
-          await call("chat.postMessage", { channel: channel.id, ...content(text) });
+          const sent = await call<{ ts: string }>("chat.postMessage", { channel: channel.id, ...content(text) });
+          return { chat: channel.id, platformId: sent.ts };
         },
 
         async listMembers() {
@@ -446,6 +467,15 @@ export function slackChannel(options: SlackOptions = {}): Channel {
 }
 
 /** Markdown block for the content, plain text for notifications and old clients. */
+/** `<@U…>` for people and bot users; anything else (a bot_id) stays `@name`. */
+function slackMentions(markdown: string, mentions: readonly Mention[] | undefined): string {
+  return renderMentions(
+    markdown,
+    mentions?.filter((m) => /^[UW][A-Z0-9]+$/.test(m.id)),
+    (m) => `<@${m.id}>`,
+  );
+}
+
 function content(markdown: string) {
   return { text: markdown.slice(0, 3000), blocks: [{ type: "markdown", text: markdown }] };
 }
@@ -541,8 +571,12 @@ export async function toInbound(
       : { platformId: event.channel, kind: "group" };
 
   let text = raw.replaceAll(`<@${botUserId}>`, "");
+  const others: { id: string; name: string; isBot: boolean }[] = [];
   for (const match of [...text.matchAll(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g)]) {
-    text = text.replace(match[0], `@${(await nameOf(match[1] as string)) || match[1]}`);
+    const id = match[1] as string;
+    const name = await nameOf(id);
+    if (!others.some((o) => o.id === id)) others.push({ id, name, isBot: false });
+    text = text.replace(match[0], `@${name || id}`);
   }
   text = text
     .replace(/<(https?:[^|>]+)\|([^>]+)>/g, "$2 ($1)")
@@ -577,6 +611,7 @@ export async function toInbound(
     ...(!addressed && thread ? { replyTo: thread } : {}),
     addressedToBot: addressed,
     mentioned,
+    ...(others.length ? { mentions: others } : {}),
     sentAt: Math.round(Number(event.ts) * 1000),
   };
 }

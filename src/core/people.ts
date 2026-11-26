@@ -119,6 +119,7 @@ export function info(store: Store, agentId: string, id: string) {
       owner: k.owner,
       bot: k.isBot && !k.owner,
       linkedBy: k.linkedBy,
+      profile: k.profile,
       chats: store.contactChats(k).map((c) => ({ id: c.id, kind: c.kind, name: c.name, lastAt: c.lastAt })),
     })),
   };

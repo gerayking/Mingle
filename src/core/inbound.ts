@@ -10,6 +10,7 @@ import type { InboundState } from "../store/store.ts";
  * to a message the owner already ignored.
  *
  *   deliver: received ──▶ delivered
+ *   requeue: delivered ──▶ received
  *   give_up: delivered ──▶ unanswered
  *   fail:    received, delivered ──▶ failed
  *   hold:    received, delivered ──▶ waiting
@@ -32,6 +33,8 @@ import type { InboundState } from "../store/store.ts";
 export type InboundEvent =
   /** Handed to the agent's session. */
   | "deliver"
+  /** The session was replaced before a queued message reached a turn, or Mingle stopped mid-turn. */
+  | "requeue"
   /** Could not be handed over, or the turn it was in failed. */
   | "fail"
   /** As `fail`, but the failure passes (a usage limit, a busy provider): try again at a set time. */
@@ -59,6 +62,7 @@ export const INBOUND: Readonly<
   Record<InboundEvent, { readonly from: readonly InboundState[]; readonly to: InboundState }>
 > = {
   deliver: { from: ["received"], to: "delivered" },
+  requeue: { from: ["delivered"], to: "received" },
   fail: { from: ["received", "delivered"], to: "failed" },
   hold: { from: ["received", "delivered"], to: "waiting" },
   resume: { from: ["waiting"], to: "received" },

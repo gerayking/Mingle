@@ -1,10 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { InboundMessage, OnboardingEvent } from "../src/channels/channel.ts";
 import { type Frame, toInbound, type WecomClientLike, wecomChannel } from "../src/channels/wecom/wecom.ts";
 import { until } from "./helpers.ts";
 
-/** A stand-in for the SDK's WSClient. */
-function fakeClient(options: { authFails?: boolean } = {}) {
+/** A stand-in for the SDK's WSClient. `replyFails` throws on the next replyStream calls, one each. */
+function fakeClient(options: { authFails?: boolean; replyFails?: unknown[] } = {}) {
   const handlers = new Map<string, ((...args: unknown[]) => void)[]>();
   const calls: { method: string; args: unknown[] }[] = [];
   const emit = (event: string, ...args: unknown[]) => {
@@ -26,6 +26,8 @@ function fakeClient(options: { authFails?: boolean } = {}) {
     },
     async replyStream(...args) {
       calls.push({ method: "replyStream", args });
+      const failure = options.replyFails?.shift();
+      if (failure !== undefined) throw failure;
     },
     async sendMessage(...args) {
       calls.push({ method: "sendMessage", args });
@@ -158,6 +160,85 @@ describe("wecom connection", () => {
       "wr123",
       { msgtype: "markdown", markdown: { content: "主动消息" } },
     ]);
+    await connection.close();
+  });
+
+  it("sends actively once the cached frame is 30 minutes old, with no inbound since", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const fake = fakeClient();
+      const received: InboundMessage[] = [];
+      const connection = await wecomChannel({ createClient: () => fake.client }).connect(
+        { botId: "aib1", secret: "s" },
+        { onMessage: (m) => received.push(m), onState: () => {}, onMembership: () => {} },
+      );
+      fake.emit("message", frame({ text: { content: "hi" } }));
+      await until(() => received.length === 1, 1000);
+
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      const result = await connection.send({
+        chat: { platformId: "zhangsan", kind: "dm" },
+        text: "答案",
+        replyTo: "msg1",
+      });
+      expect(result).toMatchObject({ kind: "sent", degraded: ["quote_dropped"] });
+      expect(fake.calls.filter((c) => c.method === "replyStream")).toHaveLength(0);
+      expect(fake.calls.filter((c) => c.method === "sendMessage")).toHaveLength(1);
+      // The expired frame is gone: a live reply cannot be opened on it either.
+      await expect(
+        connection.startLive?.({ platformId: "zhangsan", kind: "dm" }, { replyTo: "msg1", initial: "…" }),
+      ).rejects.toThrow();
+      await connection.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    Object.assign(new Error("invalid req_id"), { errcode: 846605 }),
+    { errcode: 846608 }, // The SDK rejects with the plain ack frame, not an Error.
+  ])("falls back to active send, once, when the frame is refused with %s", async (failure) => {
+    const fake = fakeClient({ replyFails: [failure] });
+    const received: InboundMessage[] = [];
+    const connection = await wecomChannel({ createClient: () => fake.client }).connect(
+      { botId: "aib1", secret: "s" },
+      { onMessage: (m) => received.push(m), onState: () => {}, onMembership: () => {} },
+    );
+    fake.emit("message", frame({ text: { content: "hi" } }));
+    await until(() => received.length === 1, 1000);
+
+    const result = await connection.send({
+      chat: { platformId: "zhangsan", kind: "dm" },
+      text: "答案",
+      replyTo: "msg1",
+    });
+    expect(result).toMatchObject({ kind: "sent", degraded: ["quote_dropped"] });
+    expect(fake.calls.filter((c) => c.method === "replyStream")).toHaveLength(1);
+    expect(fake.calls.filter((c) => c.method === "sendMessage")).toHaveLength(1);
+    // The refused frame was dropped: the next reply goes active without trying it again.
+    await connection.send({ chat: { platformId: "zhangsan", kind: "dm" }, text: "补充", replyTo: "msg1" });
+    expect(fake.calls.filter((c) => c.method === "replyStream")).toHaveLength(1);
+    expect(fake.calls.filter((c) => c.method === "sendMessage")).toHaveLength(2);
+    await connection.close();
+  });
+
+  it("does not fall back to active send on an ambiguous failure", async () => {
+    const fake = fakeClient({ replyFails: [new Error("timeout")] });
+    const received: InboundMessage[] = [];
+    const connection = await wecomChannel({ createClient: () => fake.client }).connect(
+      { botId: "aib1", secret: "s" },
+      { onMessage: (m) => received.push(m), onState: () => {}, onMembership: () => {} },
+    );
+    fake.emit("message", frame({ text: { content: "hi" } }));
+    await until(() => received.length === 1, 1000);
+
+    const result = await connection.send({
+      chat: { platformId: "zhangsan", kind: "dm" },
+      text: "答案",
+      replyTo: "msg1",
+    });
+    expect(result).toMatchObject({ kind: "failed" });
+    expect(fake.calls.filter((c) => c.method === "sendMessage")).toHaveLength(0);
     await connection.close();
   });
 });

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,7 +12,7 @@ import {
   UnsupportedOptionError,
 } from "@botiverse/oar";
 import { createSessionKernel } from "@botiverse/oar/kernel";
-import { eventsOf, usageOf } from "@botiverse/oar/observe";
+import { eventsOf, promptAndWait, usageOf } from "@botiverse/oar/observe";
 import { scriptedRuntime } from "@botiverse/oar/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { oarHarness, usageWindows } from "../src/harness/harness.ts";
@@ -88,6 +88,82 @@ describe("harness list", () => {
     expect(peak).toBe(2);
     expect(list.map((h) => h.id)).toEqual(["claude", "codex"]);
     expect(list[0]?.version).toBe("1.2.3");
+  });
+
+  it("offers Devin and Factory Droid as usable harnesses, after the others", async () => {
+    const installed = (id: string): Runtime => ({
+      ...defaultRuntimes.require(id),
+      installation: async () => ({ kind: "available", via: "executable", command: id, version: "1.0.0" }),
+    });
+    const runtimes = ["factory", "devin", "claude"].map(installed);
+    const source = {
+      require: (id: string): Runtime => {
+        const found = runtimes.find((r) => r.id === id);
+        if (!found) throw new Error("not offered here");
+        return found;
+      },
+      list: () => runtimes,
+    };
+    const list = await oarHarness(source).available();
+    expect(list.map((h) => h.id)).toEqual(["claude", "devin", "factory"]);
+    for (const entry of list) expect(entry.disabled).toBeUndefined();
+    // Devin takes the environment but not an appended prompt; Factory Droid takes both.
+    expect(list.find((h) => h.id === "devin")?.noEnv).toBeUndefined();
+    expect(list.find((h) => h.id === "factory")?.noEnv).toBeUndefined();
+    expect(list.find((h) => h.id === "factory")?.icon).toBeDefined();
+  });
+
+  /** CodeBuddy whose probe answers from `answers` in turn, found at a real file. */
+  function flaky(answers: ("found" | "missed" | "timeout" | "refused")[]) {
+    const command = join(cwd(), "codebuddy.cmd");
+    writeFileSync(command, "");
+    let calls = 0;
+    const runtime: Runtime = {
+      ...defaultRuntimes.require("codebuddy"),
+      installation: async () => {
+        const answer = answers[Math.min(calls++, answers.length - 1)];
+        if (answer === "timeout") throw new Error("Failed to run codebuddy.cmd --help: timeout after 15000 ms");
+        if (answer === "missed") return { kind: "not_found" };
+        if (answer === "refused") return { kind: "unsupported", reason: "--help failed" };
+        return { kind: "available", via: "executable", command, version: "2.184.0" };
+      },
+    };
+    const harness = oarHarness({
+      require: (id) => {
+        if (id !== "codebuddy") throw new Error("not offered here");
+        return runtime;
+      },
+      list: () => [runtime],
+    });
+    const installed = async () => (await harness.catalog?.())?.find((h) => h.id === "codebuddy")?.installed;
+    return { command, harness, installed, calls: () => calls };
+  }
+
+  it("keeps a harness whose probe missed it while its executable is still there", async () => {
+    const { command, harness, installed } = flaky(["found", "missed", "timeout", "missed"]);
+    expect(await installed()).toBe(true);
+    expect(await installed()).toBe(true);
+    expect(await installed()).toBe(true);
+    // Sessions use the copy found last instead of failing on the missed probe.
+    expect((await harness.available()).map((h) => h.id)).toEqual(["codebuddy"]);
+    rmSync(command);
+    expect(await installed()).toBe(false);
+  });
+
+  it("believes a harness that ran and refused", async () => {
+    const { installed } = flaky(["found", "refused"]);
+    expect(await installed()).toBe(true);
+    expect(await installed()).toBe(false);
+  });
+
+  it("shares one probe between the list and the catalog asked together", async () => {
+    const { harness, calls } = flaky(["found"]);
+    const [list, catalog] = await Promise.all([harness.available(), harness.catalog?.()]);
+    expect(calls()).toBe(1);
+    expect(list.map((h) => h.id)).toEqual(["codebuddy"]);
+    expect(catalog?.[0]?.installed).toBe(true);
+    await harness.catalog?.();
+    expect(calls()).toBe(2);
   });
 });
 
@@ -418,8 +494,64 @@ describe("undeclared open-time refusals", () => {
     const runtime = failing(new UnsupportedOptionError("appendSystemPrompt", "fixture refusal"));
     await expect(open("flaky", runtime)).rejects.toMatchObject({
       code: "harness_incompatible",
-      next: "This harness cannot apply the settings Mingle needs. Choose another harness.",
+      next: "This harness cannot apply the settings Mingle needs (appendSystemPrompt: fixture refusal). Choose another harness.",
     });
+  });
+
+  it("opens a new session when the harness will not resume the saved one", async () => {
+    // Pi with unregistered pending tools, DSH with a session saved elsewhere: the refusal is about
+    // that conversation. Retrying the same resume would fail on every message forever.
+    const sessionSpy = vi
+      .fn()
+      .mockRejectedValueOnce(new UnsupportedOptionError("resume", "fixture: cannot resume this one"))
+      .mockResolvedValueOnce(fakeSession("s-new"));
+    const runtime = { ...scriptedRuntime({ id: "flaky", turn: () => {} }), session: sessionSpy } as Runtime;
+    const session = await open("flaky", runtime, "s-old");
+    expect(session).toMatchObject({ id: "s-new", resumed: false });
+    expect(sessionSpy.mock.calls[0]?.[1]).toMatchObject({ resume: "s-old", appendSystemPrompt: PROMPT });
+    expect(sessionSpy.mock.calls[1]?.[1]).not.toHaveProperty("resume");
+    expect(sessionSpy.mock.calls[1]?.[1]).toMatchObject({ appendSystemPrompt: PROMPT });
+  });
+
+  it("still reports incompatibility when a new session is refused too", async () => {
+    const runtime = failing(new UnsupportedOptionError("model", "fixture refusal"));
+    await expect(open("flaky", runtime, "s-old")).rejects.toMatchObject({ code: "harness_incompatible" });
+    expect(runtime.session).toHaveBeenCalledTimes(2);
+  });
+
+  it("resumes Grok without an appended prompt, which it keeps from the saved session", async () => {
+    // The real Grok runtime refuses appendSystemPrompt on every resume (OAR 0.97): after any
+    // restart, every Grok agent stopped with harness_incompatible.
+    const grok = defaultRuntimes.require("grok");
+    const install = { kind: "available", via: "executable", command: "/nonexistent/grok", version: "1.0.52" } as const;
+    await expect(
+      grok.session(install, { cwd: cwd(), appendSystemPrompt: PROMPT, resume: "s-old" }),
+    ).rejects.toMatchObject({ name: "UnsupportedOptionError", option: "appendSystemPrompt" });
+
+    const delivered: string[] = [];
+    const sessionSpy = vi.fn(async (_install: unknown, options: { appendSystemPrompt?: string; resume?: string }) => {
+      if (options.resume && options.appendSystemPrompt !== undefined)
+        throw new UnsupportedOptionError(
+          "appendSystemPrompt",
+          "Grok does not reapply appendSystemPrompt alone on resume",
+        );
+      return {
+        ...fakeSession(options.resume ?? "s-new"),
+        deliver: async (text: string) => {
+          delivered.push(text);
+          return { landed: "prompted" };
+        },
+      } as unknown as Session;
+    });
+    const runtime = { ...grok, installation: async () => install, session: sessionSpy } as unknown as Runtime;
+    const session = await open("grok", runtime, "s-old");
+    expect(session).toMatchObject({ id: "s-old", resumed: true });
+    expect(sessionSpy).toHaveBeenCalledTimes(2);
+    expect(sessionSpy.mock.calls[1]?.[1]).not.toHaveProperty("appendSystemPrompt");
+    expect(sessionSpy.mock.calls[1]?.[1]).toMatchObject({ resume: "s-old", env: ENV });
+    // The saved session has its guide: it is not repeated in the message.
+    await session.deliver("hello", "i1");
+    expect(delivered).toEqual(["hello"]);
   });
 
   it("keeps an ordinary failure as itself, not mislabeled unsupported", async () => {
@@ -507,6 +639,102 @@ describe("stopping work", () => {
     expect(await session.abort()).toBe(true);
     expect(seen).toEqual(["self", "ended:aborted"]);
   });
+
+  it("opens a self-initiated turn immediately on turn_active before the model emits tokens", async () => {
+    const { opening, emit, seen } = driven();
+    await opening;
+    emit({ kind: "turn_started" });
+    // Normal prompted turn: turn_active must not fire a second onTurnStarted.
+    emit({ kind: "turn_active", inputId: "in-1" });
+    emit({ kind: "text_delta" });
+    emit({ kind: "turn_ended", outcome: { kind: "completed" } });
+    // Background task finishes and the harness starts a turn on its own (system/init → turn_active).
+    emit({ kind: "turn_active" });
+    expect(seen).toEqual(["prompted", "ended:completed", "self"]);
+    // First model token arrives later (slow TTFT): still the same turn, no duplicate start.
+    emit({ kind: "reasoning" });
+    emit({ kind: "text_delta" });
+    emit({ kind: "turn_ended", outcome: { kind: "completed" } });
+    // A queued input whose turn starts natively (turn_active with inputId) is prompted, not self.
+    emit({ kind: "turn_active", inputId: "in-2" });
+    emit({ kind: "turn_ended", outcome: { kind: "completed" } });
+    expect(seen).toEqual(["prompted", "ended:completed", "self", "ended:completed", "prompted", "ended:completed"]);
+  });
+
+  it("keeps empty-turn detection accurate when a prompted turn emits turn_active without model output", async () => {
+    let emit: (event: Record<string, unknown>) => void = () => {};
+    const session = {
+      ...fakeSession(),
+      events: (observer: (event: Record<string, unknown>) => void) => {
+        emit = (event) => observer({ agentPath: [], ...event });
+        return () => {};
+      },
+    } as unknown as Session;
+    const runtime = {
+      ...scriptedRuntime({ id: "claude", turn: () => {} }),
+      installation: async () => ({ kind: "available", via: "bundled" }),
+      session: async () => session,
+    } as unknown as Runtime;
+    const ended: unknown[] = [];
+    await oarHarness({ require: () => runtime }).open(
+      { harness: "claude", cwd: cwd(), appendSystemPrompt: PROMPT, env: ENV },
+      {
+        onTurnStarted: () => {},
+        onTurnEnded: (outcome) => ended.push(outcome),
+        onActivity: () => {},
+      },
+    );
+    emit({ kind: "turn_started" });
+    emit({ kind: "turn_active", inputId: "in-1" });
+    emit({ kind: "turn_ended", outcome: { kind: "completed" } });
+    expect(ended).toEqual([{ kind: "completed", empty: true }]);
+  });
+
+  it("ends an open turn or background wait with runtime_exited on unexpected exit, but not on dispose", async () => {
+    let emit: (event: Record<string, unknown>) => void = () => {};
+    const session = {
+      ...fakeSession(),
+      events: (observer: (event: Record<string, unknown>) => void) => {
+        emit = (event) => observer({ agentPath: [], ...event });
+        return () => {};
+      },
+      dispose: async () => {
+        emit({ kind: "exited", code: 0 });
+      },
+    } as unknown as Session;
+    const runtime = {
+      ...scriptedRuntime({ id: "claude", turn: () => {} }),
+      installation: async () => ({ kind: "available", via: "bundled" }),
+      session: async () => session,
+    } as unknown as Runtime;
+    const ended: unknown[] = [];
+    const opened = await oarHarness({ require: () => runtime }).open(
+      { harness: "claude", cwd: cwd(), appendSystemPrompt: PROMPT, env: ENV },
+      {
+        onTurnStarted: () => {},
+        onTurnEnded: (outcome) => ended.push(outcome),
+        onActivity: () => {},
+      },
+    );
+    // Crash mid-turn: immediately reports runtime_exited and clears background tasks.
+    emit({ kind: "turn_started" });
+    emit({ kind: "task_started", taskId: "t1", taskType: "shell", background: true });
+    emit({ kind: "exited", code: 137 });
+    expect(opened.background?.()).toBe(0);
+    expect(ended).toEqual([{ kind: "failed", failure: "runtime_exited", reason: "the harness exited (code 137)" }]);
+
+    // Crash while waiting on background work after a turn ended: also reports runtime_exited.
+    emit({ kind: "task_started", taskId: "t2", taskType: "shell", background: true });
+    emit({ kind: "exited", code: null, reason: "killed" });
+    expect(opened.background?.()).toBe(0);
+    expect(ended).toHaveLength(2);
+    expect(ended[1]).toEqual({ kind: "failed", failure: "runtime_exited", reason: "killed" });
+
+    // Normal dispose emits exited: must not report a failure.
+    emit({ kind: "turn_started" });
+    await opened.dispose();
+    expect(ended).toHaveLength(2);
+  });
 });
 
 describe("turn usage", () => {
@@ -575,4 +803,19 @@ describe("turn usage", () => {
       }
     },
   );
+});
+
+it("runs Devin ACP's full terminal command with the session environment", async () => {
+  const dir = cwd();
+  copyFileSync(new URL("./fixtures/devin-acp.cjs", import.meta.url), join(dir, "acp"));
+  const session = await defaultRuntimes
+    .require("devin")
+    .session({ kind: "available", via: "executable", command: process.execPath }, { cwd: dir, env: ENV });
+  try {
+    const result = await promptAndWait(session, "check the terminal", { timeoutMs: 3000 });
+    expect(result).toMatchObject({ kind: "ended", outcome: { kind: "completed" } });
+    expect(result.kind === "ended" && result.text.trim()).toBe("present");
+  } finally {
+    await session.dispose();
+  }
 });

@@ -34,8 +34,19 @@ const QR_TTL_MS = 5 * 60_000;
 const POLL_EVERY_MS = 3000;
 /** WeCom splits markdown above roughly 4 KB; stay under it. */
 const MAX_TEXT = 3500;
-/** Inbound frames kept for streaming replies. */
+/**
+ * Inbound frames kept for streaming replies. A local bound on how long the passive reply
+ * credential is trusted, not a platform guarantee; a clearly refused frame falls back to
+ * active send (errcode below).
+ */
 const FRAME_TTL_MS = 30 * 60_000;
+/** The passive reply credential is no longer valid: the req_id is unknown, or the stream expired. */
+const FRAME_REJECTED = new Set([846605, 846608]);
+/**
+ * A stream reply ends by itself ten minutes after it began (the platform docs; to be verified on
+ * a real bot). Mingle hands over a minute before that.
+ */
+const STREAM_WINDOW_MS = 9 * 60_000;
 
 const CAPABILITIES: Capabilities = {
   quoteReply: true,
@@ -210,6 +221,17 @@ export function wecomChannel(options: WecomOptions = {}): Channel {
         }
       };
 
+      /** The cached inbound frame a reply can still ride on; expired entries are dropped on read. */
+      const freshFrame = (id: string): Frame | undefined => {
+        const known = frames.get(id);
+        if (!known) return undefined;
+        if (Date.now() - known.at > FRAME_TTL_MS) {
+          frames.delete(id);
+          return undefined;
+        }
+        return known.frame;
+      };
+
       client.on("message", ((frame: Frame) => {
         const inbound = toInbound(frame);
         if (!inbound || !frame.body) return;
@@ -237,14 +259,25 @@ export function wecomChannel(options: WecomOptions = {}): Channel {
         async send(message: OutboundMessage): Promise<SendResult> {
           let textId = "";
           try {
-            const known = message.replyTo ? frames.get(message.replyTo) : undefined;
+            let frame = message.replyTo ? freshFrame(message.replyTo) : undefined;
             if (message.text) {
-              if (known) await client.replyStream(known.frame, randomUUID(), message.text, true);
-              else
+              if (frame) {
+                try {
+                  await client.replyStream(frame, randomUUID(), message.text, true);
+                } catch (error) {
+                  // The credential was refused outright: drop it and send actively, once. An
+                  // ambiguous failure (a timeout, a broken socket) keeps the old error contract.
+                  if (!FRAME_REJECTED.has(wecomErrcode(error) ?? 0)) throw error;
+                  if (message.replyTo && frames.get(message.replyTo)?.frame === frame) frames.delete(message.replyTo);
+                  frame = undefined;
+                }
+              }
+              if (!frame) {
                 await client.sendMessage(chatIdOf(message.chat), {
                   msgtype: "markdown",
                   markdown: { content: message.text },
                 });
+              }
               textId = `out-${randomUUID()}`;
             }
             for (const file of message.files ?? []) {
@@ -256,7 +289,7 @@ export function wecomChannel(options: WecomOptions = {}): Channel {
             return {
               kind: "sent",
               platformId: `out-${randomUUID()}`,
-              ...(message.replyTo && !known ? { degraded: ["quote_dropped" as const] } : {}),
+              ...(message.replyTo && !frame ? { degraded: ["quote_dropped" as const] } : {}),
             };
           } catch (error) {
             return withTextSent(
@@ -274,17 +307,21 @@ export function wecomChannel(options: WecomOptions = {}): Channel {
         async react() {},
 
         async startLive(_chat: ChatRef, options: LiveOptions): Promise<LiveReply> {
-          const known = frames.get(options.replyTo);
-          if (!known) throw new Error("no inbound frame to stream a reply to");
+          const frame = freshFrame(options.replyTo);
+          if (!frame) throw new Error("no inbound frame to stream a reply to");
           const streamId = randomUUID();
-          await client.replyStream(known.frame, streamId, options.initial, false);
+          // The window starts when the stream does (the docs count from the start), not when the
+          // first write returns.
+          const until = Date.now() + STREAM_WINDOW_MS;
+          await client.replyStream(frame, streamId, options.initial, false);
           return {
+            until,
             update: async (markdown) => {
-              await client.replyStream(known.frame, streamId, markdown, false).catch(() => {});
+              await client.replyStream(frame, streamId, markdown, false).catch(() => {});
             },
             finish: async (markdown) => {
               try {
-                await client.replyStream(known.frame, streamId, markdown, true);
+                await client.replyStream(frame, streamId, markdown, true);
                 return { kind: "sent", platformId: `stream-${streamId}` };
               } catch {
                 // The stream may have expired; the outbox then sends the answer as a new message.
@@ -325,6 +362,12 @@ export function wecomChannel(options: WecomOptions = {}): Channel {
       client.disconnect();
     }
   }
+}
+
+/** The errcode of a refused WeCom call: the SDK rejects with the plain ack frame. */
+function wecomErrcode(error: unknown): number | undefined {
+  const code = (error as { errcode?: unknown } | null | undefined)?.errcode;
+  return typeof code === "number" ? code : undefined;
 }
 
 function authenticate(client: WecomClientLike, timeoutMs: number): Promise<void> {

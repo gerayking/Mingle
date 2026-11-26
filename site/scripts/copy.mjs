@@ -5,35 +5,75 @@ export const copy = {
   en: {
     lang: "en",
     path: "/",
-    title: "Mingle: your agent, in the chats you already use",
+    title: "Mingle: one agent in every chat app",
     description:
-      "Mingle brings Claude Code, Codex or another coding agent you already have into WeChat, Feishu, Slack, Telegram and more as a bot, with a name, a role and a memory. It answers @mentions on GitHub and talks with you in iMessage. It runs on your computer. There is no Mingle server.",
-    nav: { demo: "Try it", how: "How it works", agent: "The agent", brains: "Brains", privacy: "Privacy", cli: "CLI" },
+      "Mingle brings the coding agent you already use, like Claude Code or Codex, into WeChat, Feishu, Slack, Telegram and more, plus GitHub and iMessage: one agent with a name and a memory, in all of them at once, doing several things at a time. It runs on your computer. There is no Mingle server.",
+    nav: { demo: "One agent", parallel: "At once", how: "Get started", privacy: "No server", cli: "CLI" },
     download: "Download",
-    downloadFor: { mac: "Download for Mac", windows: "Download for Windows", linux: "Download for Linux" },
+    downloadFor: {
+      mac: "Download for Mac",
+      windows: "Download for Windows",
+      linux: "Download for Linux",
+      any: "Download",
+    },
+    alsoFor: { mac: "macOS", windows: "Windows", linux: "Linux", pair: "{a} and {b}", intel: "Intel Mac" },
     installTerminal: "Install from a terminal",
     hero: {
-      eyebrow: "Free and open source",
-      title: "Your agent, in the chats<br>you already use.",
-      lead: "Mingle turns Claude Code, Codex or another coding agent you already have into a companion with a name, a role and a memory. It joins WeChat, Feishu, Slack, Telegram and four more chat apps as a bot, answers @mentions on GitHub, and talks with you in iMessage. It runs on your computer. There is no Mingle server.",
-      meta: "macOS · Windows · Linux · MIT licensed · No account",
+      title: "One agent.<br><span>Every chat app.</span>",
+      lead: "The coding agent you already use, like Claude Code or Codex, in WeChat, Feishu, Slack, Telegram and the rest of your chats. One name, one memory, several things at once. On your own computer.",
+      open: "Open source",
+      alt: "The Mingle console: Alex in Telegram, Slack, Discord, WeChat and GitHub, with its recent messages and two things under way",
+    },
+    logos: { harnesses: "Harnesses", apps: "Chat apps" },
+    film: {
+      eyebrow: "Product film",
+      title: "See Mingle in 40 seconds.",
+      lead: "Pick your local coding agent, connect Slack, Discord, Telegram and the rest, and watch one agent carry the same memory across every chat app.",
+      play: "Watch film",
+      duration: "0:40",
+      tabFilm: "Product film",
+      tabConsole: "Console",
+      switchLabel: "Preview mode",
+      youtubeId: "iuBNwl8VhCc",
+      name: "Mingle — One agent in every chat app (40s product film)",
+      description:
+        "Connect your local Claude Code, Codex, or other coding agent into Slack, Discord, Telegram, GitHub, and iMessage with one shared MEMORY.md and zero Mingle server.",
+      transcript:
+        "Pick a local coding agent like Claude Code or Codex, connect Slack, Discord, Telegram, and your other chat apps, and run one agent with one shared MEMORY.md across all of them. Long tasks run in the background while quick questions get answered immediately, with everything running locally on your computer and no Mingle server.",
+    },
+    parallel: {
+      eyebrow: "Several things at once",
+      title: "Works on the side.<br><span>Answers right away.</span>",
+      lead: "Ask for something that takes a while, like fixing a bug or comparing three vendors, and Alex works on it on the side while it keeps answering everyone else. When it's done, it replies under your message.",
+      points: [
+        ["Quick answers stay quick", "A question gets its answer in seconds, even while code is being written."],
+        ["Back where you asked", "The result arrives under the message that asked for it, from Alex."],
+        ["Follow-ups find the work", "Reply to it, and the same piece of work picks up where it left off."],
+        ["Nothing to set up", "No helpers to create and no settings. Up to three things run at once."],
+      ],
+      chat: {
+        group: "Launch team",
+        asker: "Maya",
+        ask: "@Alex the login button does nothing on Safari. Can you fix it?",
+        ack: "On it. I'll reply here when it's fixed.",
+        other: "Leo",
+        quick: "@Alex what time is standup tomorrow?",
+        answer: "10:30, in room 3.",
+        done: "Fixed: Safari blocked the form's default submit. PR #212 is ready for review.",
+      },
     },
     chat: {
       group: "Weekend hikers",
       members: "5 members",
       ask: "@Alex what's the weather like for the ridge trail on Saturday?",
       asker: "Maya",
-      thinking: "Checking the forecast…",
       reply: "Sunny, 8–17 °C, light wind in the morning. Wind picks up after 2 pm, so I'd plan to be down by lunch.",
       follow: "@Alex remind everyone on Friday at 8 pm?",
       follower: "Leo",
       reply2: "Done. I'll post the time and meeting point here on Friday at 8 pm.",
     },
-    apps: { title: "Eight chat apps, GitHub and iMessage. One agent." },
     demo: {
-      eyebrow: "Try it",
-      title: "One agent. Every chat app. One memory.",
-      lead: "Pick a scene, then tap Send when it's your turn. Alex keeps its name, face and memory in every app; each app shows its own receipts and progress.",
+      lead: "Each scene plays by itself; pick one to jump to it.",
       scenes: "Scenes",
     },
     platforms: {
@@ -66,51 +106,29 @@ export const copy = {
         },
         {
           title: "Talk to it",
-          body: "Message it directly, or @ it in a group. It reacts as soon as it starts, and the reply fills in while it works. You're its owner: the one who scanned the code, or who sends it the 6-digit code the console shows.",
+          body: "Message it directly, or @ it in a group, or just call it by name. It reacts as soon as it starts, and the reply fills in while it works. You're its owner: the one who scanned the code, or who sends it the 6-digit code the console shows.",
           img: null,
         },
       ],
     },
     agent: {
-      eyebrow: "The agent",
-      title: "A companion, not a terminal in a chat window.",
-      lead: "Alex is someone you talk to, not a session you manage. It keeps one long-lived session, its own home folder and its own memory. What you told it on Telegram, it still knows on Slack. There is no <code>/new</code> and no <code>/switch</code>; the one command is <code>/stop</code>.",
-      alt: "Alex's activity in the Mingle console: messages from a Telegram group and a Slack direct message, its tasks and a reminder",
-      memory: [
-        {
-          app: "telegram",
-          chat: "Weekend hikers",
-          when: "Tuesday",
-          msgs: [
-            ["in", "Leo", "@Alex heads up, I'm vegetarian. And I can't do more than 600 m of climbing."],
-            ["out", "Alex", "Noted. I'll keep both in mind when I plan Saturday."],
-          ],
-        },
-        {
-          app: "slack",
-          chat: "Direct message",
-          when: "Friday",
-          msgs: [
-            ["in", "Maya", "Which route, and what should I bring for lunch for everyone?"],
-            [
-              "out",
-              "Alex",
-              "The north loop: 540 m of climbing, under Leo's limit. For lunch, make it vegetarian; Leo mentioned it on Tuesday.",
-            ],
-          ],
-        },
-      ],
+      eyebrow: "One agent",
+      title: "Like a person, not a bot per app.",
+      lead: "Alex isn't a separate bot in each app. It's one someone, with the same name, face and memory in every chat app it joins. Tell it something in one app and it knows it in the next. There is no <code>/new</code> and no <code>/switch</code>; the one command is <code>/stop</code>.",
       points: [
         ["Remembers across apps", "One agent, one memory, in every chat app it joins."],
         [
-          "Reads the room",
-          "In a group it keeps the conversation as background and catches up on what it missed before it answers.",
+          "Keeps up in a group",
+          "No need to @ it every time. Once someone is talking with it, it picks up when they finish, often with a quick line before the longer answer. Chatter that isn't for it, it just hears, without spending much.",
         ],
         [
           "Knows who's who",
           "An address book of everyone it talks to. Link one person's accounts and it knows Leo on Telegram is Leo on Slack.",
         ],
-        ["Tasks and reminders", "It writes down what it's working on and speaks up on time."],
+        [
+          "Tasks and reminders",
+          "It writes down what it's working on and speaks up on time. It can keep an eye on CI, a web page or a new release, and only spends a turn when something changes.",
+        ],
         ["Shows its work", "A reaction on your message, then a live reply that becomes the answer."],
         ["Files both ways", "Send it a file or a photo; it sends files back, on every app."],
       ],
@@ -118,16 +136,35 @@ export const copy = {
     brains: {
       eyebrow: "Brains",
       title: "Bring the brain you already pay for.",
-      lead: "Mingle doesn't call a model itself. It drives the coding agent you've installed and signed in to, with your own subscription or API key. Pick a model per agent and change it any time; the next message uses it. Settings shows how much of each harness's quota is left, and installs and updates harnesses for you.",
+      lead: "Mingle drives the coding agent you have already installed and signed in to. Pick any of them per agent, and switch any time.",
       note: "Tested end to end with Claude Code, Codex, OpenCode and Kimi Code.",
+      points: [
+        ["Your subscription or key", "Mingle never calls a model itself. The harness you signed in to does."],
+        ["A model per agent", "Change it any time. The next message uses it."],
+        ["Quota at a glance", "Settings shows how much of each harness's quota is left."],
+        ["Installed for you", "A missing harness installs, signs in and updates from the app."],
+      ],
     },
     privacy: {
-      eyebrow: "Privacy",
-      title: "Your data stays on your machine.",
+      eyebrow: "No server",
+      title: "There is no Mingle server.<br><span>So nothing of yours is on one.</span>",
+      lead: "Mingle isn't a service you sign up for. It's a program on your computer that links your chat apps to your own agent directly. No account, no cloud relay, no telemetry: no database of your chats for anyone to break into, and no one at Mingle who could read them.",
+      flow: {
+        brains: "Your agent",
+        brainsNote: "your own subscription",
+        apps: "Your chat apps",
+        appsNote: "official bot APIs",
+        where: "127.0.0.1 · on your computer",
+        rows: [
+          ["Memory and files", "your disk"],
+          ["Bot tokens", "system keychain"],
+          ["Account, telemetry", "none"],
+        ],
+      },
       items: [
         [
-          "No Mingle server",
-          "Mingle is a program on your computer, with no account and no telemetry. The console listens on 127.0.0.1 and nowhere else.",
+          "Local only",
+          "The console listens on 127.0.0.1 and nowhere else. The agent's memory and files stay in its own folder on your disk.",
         ],
         [
           "Strangers ask first",
@@ -144,38 +181,11 @@ export const copy = {
       ],
       note: "Your messages still pass through the chat app and your model provider. That part is theirs, not ours.",
     },
-    details: {
-      eyebrow: "Details",
-      title: "Small, quiet and out of the way.",
-      items: [
-        ["A desktop app", "Lives in the menu bar or tray, keeps Mingle running, opens at login and updates itself."],
-        [
-          "Needs you, in one place",
-          "A broken connection, a pending admin approval or an unanswered message, each with what to do.",
-        ],
-        [
-          "Retry what it missed",
-          "A message it failed or didn't answer gets a Retry button. It knows the answer is late.",
-        ],
-        [
-          "Errors in plain words",
-          "Signed out, out of usage, busy: the chat and the console say what happened and what helps. Usage limits wait and retry by themselves.",
-        ],
-        [
-          "Catch it up",
-          "Have another Claude Code or Codex session write a handoff; the agent files it into its own memory and tasks.",
-        ],
-        [
-          "Diagnose a problem",
-          "One click copies a prompt for a local agent to read Mingle's log, find the cause and draft an issue for you.",
-        ],
-        [
-          "A name and a face",
-          "Rename it and give it a picture. Pause it when you need quiet; it picks up where it left off.",
-        ],
-        ["Light and dark, two languages", "Follows your system's appearance. English and Chinese."],
-        ["Open source", "MIT licensed. Read it, build it, change it."],
-      ],
+    handoff: {
+      eyebrow: "Handoff",
+      title: "Catch it up from any conversation.",
+      lead: "Been working on something in Claude Code or Codex? Copy one prompt into that conversation and it writes Alex a handoff: the progress, the decisions, your preferences. Alex files it into its memory and tasks without stopping what it's doing.",
+      alt: "The Handoff panel in Alex's settings: copy a prompt, send it to the agent you're using, and Alex files it into its memory",
     },
     cli: {
       eyebrow: "Terminal",
@@ -198,9 +208,32 @@ export const copy = {
       agentsBody:
         'Start with <a href="/llms.txt">llms.txt</a>. Inside Mingle, an agent gets its guide from <code>mingle manual</code>.',
     },
+    faq: {
+      eyebrow: "Questions",
+      title: "Common questions.",
+      items: [
+        [
+          "Does my data go to a Mingle server?",
+          "No. There is no Mingle server, no account and no telemetry. Mingle runs locally on your computer and connects straight to each chat app and your local harness. Messages still pass through the chat app and your model provider.",
+        ],
+        [
+          "Do I need a separate API key?",
+          "No, if your coding agent is already signed in with a subscription, such as Claude Code or Codex. An API key configured in your harness also works. Mingle never calls a model itself or adds a fee.",
+        ],
+        [
+          "Which coding agents and chat apps are supported?",
+          "Mingle supports 14 coding-agent harnesses through OAR (tested end to end with Claude Code, Codex, OpenCode and Kimi Code) and connects to WeChat, WeCom, Feishu, DingTalk, QQ, Slack, Discord, Telegram, GitHub and iMessage on Mac.",
+        ],
+        [
+          "Does one agent really share memory across chat apps?",
+          "Yes. Each agent has one long-lived session and one local home folder (ROLE.md, MEMORY.md and notes/) shared across every chat app it joins. You can ask it in one app about a decision made in another.",
+        ],
+      ],
+    },
     end: {
-      title: "Bring your agent to the group chat.",
-      lead: "Free, open source, and on your own computer.",
+      title: "One agent. Every chat app.",
+      lead: "Free and open source, on your own computer. For macOS, Windows and Linux.",
+      github: "View on GitHub",
       installation: "See this release's notes for signing details and installation instructions.",
       releaseNotes: "Release notes",
     },
@@ -208,41 +241,77 @@ export const copy = {
       disclaimer:
         "Mingle is not affiliated with the chat apps or model providers named here. Their names and marks belong to their owners.",
       changelog: "Changelog",
+      contact: "Contact",
     },
     langName: "English",
   },
   zh: {
     lang: "zh-CN",
     path: "/zh/",
-    title: "Mingle：把你的 Agent 请进你已经在用的聊天软件",
+    title: "Mingle：一个 Agent，住进你所有的聊天软件",
     description:
-      "Mingle 把你已有的 Claude Code、Codex 等 coding agent 变成有名字、有角色、有记忆的伙伴，以机器人身份加入微信、飞书、Slack、Telegram 等聊天软件，也能在 GitHub 里被 @、在 iMessage 里和你聊。在你自己的电脑上运行，没有 Mingle 服务器。",
-    nav: { demo: "试一试", how: "怎么用", agent: "Agent", brains: "大脑", privacy: "隐私", cli: "命令行" },
+      "Mingle 把你已经在用的 Claude Code、Codex 这样的 coding agent，接进微信、飞书、Slack、Telegram 等聊天软件，还有 GitHub 和 iMessage：一个有名字、有记忆的 Agent，同时出现在所有地方，还能同时做好几件事。在你自己的电脑上运行，没有 Mingle 服务器。",
+    nav: { demo: "一个 Agent", parallel: "同时做几件事", how: "怎么用", privacy: "无服务器", cli: "命令行" },
     download: "下载",
-    downloadFor: { mac: "下载 Mac 版", windows: "下载 Windows 版", linux: "下载 Linux 版" },
+    downloadFor: { mac: "下载 Mac 版", windows: "下载 Windows 版", linux: "下载 Linux 版", any: "下载" },
+    alsoFor: { mac: "macOS", windows: "Windows", linux: "Linux", pair: "{a} 与 {b}", intel: "Intel Mac" },
     installTerminal: "用终端安装",
     hero: {
-      eyebrow: "免费、开源",
-      title: "把你的 Agent，<br>请进你已经在用的群聊。",
-      lead: "Mingle 把你已有的 Claude Code、Codex 等 coding agent 变成一个有名字、有角色、有记忆的伙伴。它以机器人身份加入微信、飞书、Slack、Telegram 等八个聊天软件，在 GitHub 里被 @ 时回复，也能在 iMessage 里和你聊。它在你自己的电脑上运行，没有 Mingle 服务器。",
-      meta: "macOS · Windows · Linux · MIT 许可 · 无需账号",
+      title: "一个 Agent，<br><span>住进你所有的聊天软件。</span>",
+      lead: "你已经在用的 Claude Code、Codex 这样的 coding agent，住进微信、飞书、Slack、Telegram 等聊天软件。一个名字，一份记忆，能同时做好几件事。运行在你自己的电脑上。",
+      open: "开源",
+      alt: "Mingle 控制台：Alex 接入了微信、飞书、Telegram、钉钉和 GitHub，旁边是它最近的消息和正在做的两件事",
+    },
+    logos: { harnesses: "支持的 harness", apps: "支持的聊天软件" },
+    film: {
+      eyebrow: "产品介绍",
+      title: "40 秒看懂 Mingle。",
+      lead: "选定本机 coding agent，接入飞书、Slack、微信等聊天软件，看同一个 Agent 带着同一份记忆在多端实时协作。",
+      play: "播放影片",
+      duration: "0:40",
+      tabFilm: "产品影片",
+      tabConsole: "控制台界面",
+      switchLabel: "首屏预览切换",
+      youtubeId: "TCwlEv-u7oY",
+      name: "Mingle — 一个 Agent，住进你所有的聊天软件（40 秒产品宣传片）",
+      description:
+        "把本机 Claude Code、Codex 等 coding agent 接进飞书、Slack、微信等聊天软件，共享同一份 MEMORY.md，无服务器直连。",
+      transcript:
+        "选定本机已安装的 Claude Code、Codex 等 coding agent，接入微信、飞书、钉钉、Slack、Discord、Telegram 等聊天软件。同一个 Agent 带着同一份 MEMORY.md 记忆跨端实时协作，长任务后台并行处理、简单问题秒回，全程运行在你自己的电脑上，没有 Mingle 服务器。",
+    },
+    parallel: {
+      eyebrow: "同时做几件事",
+      title: "长活在旁边做，<br><span>问题马上回。</span>",
+      lead: "交给它一件要花时间的事，比如修一个 bug、对比三家供应商，Alex 会在旁边做，同时照样回复其他人。做完了，它回到你那条消息下面。",
+      points: [
+        ["简单的问题照样秒回", "哪怕它正在写代码，别人问一句也是几秒就有答复。"],
+        ["回到你问的地方", "结果出现在当初那条消息下面，还是 Alex 在回。"],
+        ["追问接着做", "回复它的结果，同一件事从停下的地方继续。"],
+        ["什么都不用配", "不用建帮手，也没有设置，最多同时做三件。"],
+      ],
+      chat: {
+        group: "发布小组",
+        asker: "李雷",
+        ask: "@Alex 登录按钮在 Safari 上点了没反应，帮忙修一下？",
+        ack: "收到，修好了在这里回你。",
+        other: "韩梅梅",
+        quick: "@Alex 明天站会几点？",
+        answer: "明天 10:30，在 3 号会议室。",
+        done: "修好了：Safari 拦了表单的默认提交。PR #212 等你看。",
+      },
     },
     chat: {
       group: "周末徒步群",
       members: "5 位成员",
       ask: "@Alex 周六去香山那条线，天气怎么样？",
       asker: "李雷",
-      thinking: "正在查天气预报…",
       reply: "周六晴，8–17℃，上午风小。下午两点后西北风会大一些，建议中午前下山。",
       follow: "@Alex 周五晚上 8 点提醒一下大家？",
       follower: "韩梅梅",
       reply2: "好的。周五晚上 8 点我会在群里发集合时间和地点。",
     },
-    apps: { title: "八个聊天软件，加上 GitHub 和 iMessage，同一个 Agent。" },
     demo: {
-      eyebrow: "试一试",
-      title: "一个 Agent，所有聊天软件，同一份记忆。",
-      lead: "选一个场景，轮到你时点发送。Alex 在每个聊天软件里都是同一个名字、同一个头像、同一份记忆；回执和进度按各家的样子显示。",
+      lead: "每个场景会自动播放，也可以点选跳到任意一个。",
       scenes: "场景",
     },
     platforms: {
@@ -275,44 +344,26 @@ export const copy = {
         },
         {
           title: "和它说话",
-          body: "私聊它，或在群里 @ 它。它一开始处理就会回应，回复边做边更新。你是它的 owner：扫码的人就是你，或者把控制台显示的 6 位验证码私聊发给它。",
+          body: "私聊它，或在群里 @ 它、叫它的名字。它一开始处理就会回应，回复边做边更新。你是它的 owner：扫码的人就是你，或者把控制台显示的 6 位验证码私聊发给它。",
           img: null,
         },
       ],
     },
     agent: {
-      eyebrow: "Agent",
-      title: "是一个伙伴，不是聊天窗口里的终端。",
-      lead: "Alex 是你说话的对象，不是你要管理的会话。它有一个长期的会话、自己的主目录和记忆。你在 Telegram 群里说过的事，到了飞书私聊它也记得。没有 <code>/new</code>，也没有 <code>/switch</code>，唯一的命令是 <code>/stop</code>。",
-      alt: "Mingle 控制台里 Alex 的动态：来自 Telegram 群和飞书私聊的消息、它的任务和一个提醒",
-      memory: [
-        {
-          app: "telegram",
-          chat: "周末徒步群",
-          when: "周二",
-          msgs: [
-            ["in", "韩梅梅", "@Alex 提前说一下，我吃素，而且爬升别超过 600 米。"],
-            ["out", "Alex", "记下了。规划周六路线时会考虑这两点。"],
-          ],
-        },
-        {
-          app: "feishu",
-          chat: "私聊",
-          when: "周五",
-          msgs: [
-            ["in", "李雷", "走哪条线？中午给大家带什么吃的？"],
-            ["out", "Alex", "走香山北线，爬升 540 米，在韩梅梅说的范围内。午饭准备素食，她周二在群里提过。"],
-          ],
-        },
-      ],
+      eyebrow: "一个 Agent",
+      title: "像一个人，<br>而不是一群机器人。",
+      lead: "Alex 不是每个聊天软件里各自独立的机器人，而是同一个“人”：在它加入的每个聊天软件里，名字、头像、记忆都一样。你在一个软件里告诉它的事，到了另一个软件它也知道。没有 <code>/new</code>，也没有 <code>/switch</code>，唯一的命令是 <code>/stop</code>。",
       points: [
         ["跨软件记得事", "一个 Agent，一份记忆，加入的每个聊天软件都通用。"],
-        ["听得见群里在聊什么", "群里的对话它当作背景留着，回答前先补看错过的消息。"],
+        [
+          "跟得上群聊",
+          "不用每句都 @ 它。有人和它聊起来，对方说完它就接上，常常先回一句再去办；和它无关的闲聊，它只是听着，也不乱花额度。",
+        ],
         [
           "认得谁是谁",
           "说过话的人都记在通讯录里。把同一个人的账号关联起来，它就知道 Telegram 上的韩梅梅就是飞书上的韩梅梅。",
         ],
-        ["任务和提醒", "它把正在做的事记下来，到点主动开口。"],
+        ["任务和提醒", "它把正在做的事记下来，到点主动开口。也能替你盯着 CI、网页或新版本，有变化才花一轮额度。"],
         ["看得见进度", "先在你的消息上回应，再出现实时更新的回复，最后变成答案。"],
         ["文件双向收发", "发给它文件或图片，它也能发回文件，每个平台都支持。"],
       ],
@@ -320,14 +371,33 @@ export const copy = {
     brains: {
       eyebrow: "大脑",
       title: "用你已经付过费的大脑。",
-      lead: "Mingle 自己不调用模型。它驱动你已经安装并登录的 coding agent，用你自己的订阅或 API key。每个 Agent 可以单独选模型，随时可改，下一条消息起生效。设置里能看到每个 harness 还剩多少额度，也能替你安装和更新 harness。",
+      lead: "Mingle 驱动你已经安装并登录的 coding agent。每个 Agent 用哪个随你选，也随时能换。",
       note: "已用 Claude Code、Codex、OpenCode 和 Kimi Code 做过端到端测试。",
+      points: [
+        ["你自己的订阅或 key", "Mingle 自己不调用模型，调用的是你登录好的 harness。"],
+        ["每个 Agent 单独选模型", "随时可改，下一条消息起生效。"],
+        ["额度一目了然", "设置里能看到每个 harness 还剩多少额度。"],
+        ["替你安装", "没装的 harness 可以在应用里直接安装、登录和更新。"],
+      ],
     },
     privacy: {
-      eyebrow: "隐私",
-      title: "数据只在你的机器上。",
+      eyebrow: "没有服务器",
+      title: "Mingle 没有服务器，<br><span>你的数据也就不在任何服务器上。</span>",
+      lead: "Mingle 不是一个要注册的服务，而是你电脑上的一个程序，直接把聊天软件和你自己的 Agent 连起来。没有账号、没有云端中转、没有遥测：没有一个存着你聊天记录、等着被黑客攻破的数据库，Mingle 这边也没有任何人看得到你的消息。",
+      flow: {
+        brains: "你的 Agent",
+        brainsNote: "用你自己的订阅",
+        apps: "你的聊天软件",
+        appsNote: "官方机器人接口",
+        where: "127.0.0.1 · 在你的电脑上",
+        rows: [
+          ["记忆和文件", "你的硬盘"],
+          ["机器人 token", "系统钥匙串"],
+          ["账号、遥测", "没有"],
+        ],
+      },
       items: [
-        ["没有 Mingle 服务器", "Mingle 是你电脑上的一个程序，没有账号，没有遥测。控制台只监听 127.0.0.1。"],
+        ["只在本机", "控制台只监听 127.0.0.1。Agent 的记忆和文件都留在你硬盘上它自己的目录里。"],
         [
           "陌生人要先问你",
           "在谁都能找到机器人的 Telegram、Discord、QQ 上，新的人和新的群要等你同意，Agent 才会替他们做事。",
@@ -343,23 +413,11 @@ export const copy = {
       ],
       note: "消息仍然会经过聊天软件和你的模型服务商。那一段属于它们，不在我们的承诺范围内。",
     },
-    details: {
-      eyebrow: "细节",
-      title: "小巧、安静、不打扰。",
-      items: [
-        ["桌面应用", "住在菜单栏或托盘里，让 Mingle 一直运行，可开机启动，自动更新。"],
-        ["需要你处理的，集中一处", "连接出错、等管理员审核、没回复的消息，每条都写清楚怎么办。"],
-        ["漏掉的可以重试", "没回复或失败的消息旁边有“重试”。它知道这条回复晚了。"],
-        [
-          "出错说人话",
-          "没登录、额度用完、正忙：聊天里和控制台里都会说明发生了什么、怎么办。额度用完会自己等到恢复再重试。",
-        ],
-        ["给它补上下文", "让另一个 Claude Code 或 Codex 会话写一份交接，Agent 会把它整理进自己的记忆和任务。"],
-        ["一键诊断", "复制一段提示词给本机的 Agent，它会读 Mingle 的日志、找出原因，替你起草一个 issue。"],
-        ["名字和头像", "可以改名、换头像。需要安静时暂停它，恢复后接着来。"],
-        ["明暗两色，中英双语", "跟随系统外观。支持中文和英文。"],
-        ["开源", "MIT 许可。可以读、可以构建、可以改。"],
-      ],
+    handoff: {
+      eyebrow: "交接",
+      title: "从任何一段对话，给它补上下文。",
+      lead: "在 Claude Code 或 Codex 里聊了半天？把一段提示词复制过去，那段对话就会给 Alex 写一份交接：进展、决定、你的偏好。Alex 会把它整理进自己的记忆和任务，不打断手上的事。",
+      alt: "Alex 设置里的交接面板：复制提示词，发给你正在用的 agent，Alex 收到后整理进记忆",
     },
     cli: {
       eyebrow: "终端",
@@ -382,15 +440,39 @@ export const copy = {
       agentsBody:
         '从 <a href="/llms.txt">llms.txt</a> 开始。在 Mingle 里，Agent 通过 <code>mingle manual</code> 拿到自己的操作指南。',
     },
+    faq: {
+      eyebrow: "常见问题",
+      title: "常见疑问。",
+      items: [
+        [
+          "我的数据会经过 Mingle 服务器吗？",
+          "不会。Mingle 没有服务器、没有账号、没有遥测，完全运行在你自己的电脑上，直接连接聊天软件和本机 harness。消息仍然会经过聊天软件和你的模型服务商。",
+        ],
+        [
+          "需要单独买 API key 吗？",
+          "不需要。只要你本机的 Claude Code、Codex 等 harness 已经用订阅登录就能直接用，配置了 API key 也一样支持。Mingle 自己不调用模型，也不另收费。",
+        ],
+        [
+          "支持哪些 coding agent 和聊天软件？",
+          "通过 OAR 支持 14 款 coding agent（已用 Claude Code、Codex、OpenCode 和 Kimi Code 端到端验证），聊天软件支持微信、企业微信、飞书、钉钉、QQ、Slack、Discord、Telegram，以及 GitHub 和 Mac 上的 iMessage。",
+        ],
+        [
+          "同一个 Agent 在不同聊天软件里真的共享记忆吗？",
+          "是的。每个 Agent 只有一个长期会话和一份本机主目录（ROLE.md、MEMORY.md 和 notes/），接入的所有聊天软件共用同一份记忆。你可以在微信里直接问它上午在飞书群里定了什么。",
+        ],
+      ],
+    },
     end: {
-      title: "把你的 Agent 拉进群吧。",
-      lead: "免费、开源，运行在你自己的电脑上。",
+      title: "一个 Agent，住进你所有的聊天软件。",
+      lead: "免费、开源，运行在你自己的电脑上。支持 macOS、Windows 和 Linux。",
+      github: "在 GitHub 上查看",
       installation: "签名情况和安装说明见本版本的发布说明。",
       releaseNotes: "发布说明",
     },
     footer: {
       disclaimer: "Mingle 与本页提到的聊天软件和模型服务商没有关联，相关名称和标识归其所有者。",
       changelog: "更新日志",
+      contact: "联系",
     },
     langName: "中文",
   },

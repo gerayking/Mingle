@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RFC 0001 原型：群聊旁听 V2 要改的地方</title>
+<style>
+  /* Tokens from DESIGN.md, nothing else. */
+  :root {
+    --bg: #FFFFFF; --bg2: #F7F7F8; --bg3: #EFEFF2; --sel: #E7E7ED; --line: #EBEBEF; --line2: #D9D9E0;
+    --ink: #1D1D22; --ink2: #5B5B64; --ink3: #8A8A93; --accent: #5450D6; --accent-btn: #5450D6; --accent-tint: #F1F0FD;
+    --green: #2F9E5A; --amber: #975800; --wing: #F5F5F7; --card: #FFFFFF;
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    --bg: #1C1C1F; --bg2: #212125; --bg3: #2B2B30; --sel: #323238; --line: #2E2E34; --line2: #404047;
+    --ink: #EDEDF2; --ink2: #B3B3BC; --ink3: #85858F; --accent: #9895FF; --accent-btn: #5B57E0; --accent-tint: #262549;
+    --green: #4CC38A; --amber: #F7A74E; --wing: #212125; --card: #29292E;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--wing); color: var(--ink); font: 14px/20px var(--sans); -webkit-font-smoothing: antialiased; }
+  .page { max-width: 1240px; margin: 0 auto; padding: 40px 32px 64px; }
+  header.top { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 32px; }
+  h1 { font-size: 20px; line-height: 28px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 17px; line-height: 24px; font-weight: 600; margin: 48px 0 4px; }
+  h3 { font-size: 15px; line-height: 21px; font-weight: 600; margin: 0; }
+  p { margin: 0; }
+  .lead { color: var(--ink2); max-width: 760px; }
+  .small { font-size: 13px; line-height: 18px; }
+  .caption { font-size: 12px; line-height: 16px; }
+  .ink2 { color: var(--ink2); } .ink3 { color: var(--ink3); }
+  code { font: 12px/16px var(--mono); background: var(--bg2); border: 1px solid var(--line2); border-radius: 6px; padding: 0 4px; }
+
+  .seg { display: inline-flex; background: var(--bg3); border-radius: 8px; padding: 2px; gap: 2px; }
+  .seg button { all: unset; cursor: pointer; font-size: 13px; line-height: 18px; padding: 4px 12px; border-radius: 6px; color: var(--ink2); }
+  .seg button[aria-pressed="true"] { background: var(--card); color: var(--ink); font-weight: 500; box-shadow: 0 0 0 1px var(--line); }
+  .seg.sm button { font-size: 12px; line-height: 16px; padding: 3px 10px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 24px; margin-top: 16px; }
+  .frame > .label { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+  .tag { font-size: 12px; line-height: 16px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--line2); color: var(--ink2); }
+  .tag.new { border-color: transparent; background: var(--accent-tint); color: var(--accent); }
+
+  /* The conversation card, as in the console's 最近活动 */
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .conv-head { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
+  .app { width: 20px; height: 20px; border-radius: 5px; display: grid; place-items: center; color: #fff; font-size: 11px; font-weight: 600; flex: none; }
+  .app.wechat { background: #07C160; } .app.feishu { background: #3370FF; } .app.tg { background: #26A5E4; }
+  .conv-name { font-weight: 600; }
+  .grow { flex: 1; min-width: 0; }
+  .chev { color: var(--ink3); }
+  .conv-body { padding: 0 16px 12px 48px; display: flex; flex-direction: column; }
+
+  .listen { display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 8px; }
+  .row { display: flex; align-items: flex-start; gap: 12px; }
+  .row .text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .row .title { font-size: 13px; line-height: 18px; font-weight: 500; }
+  .check { width: 16px; height: 16px; margin-top: 1px; accent-color: var(--accent-btn); flex: none; }
+  .ctl { flex: none; }
+  .status { display: flex; align-items: center; gap: 6px; font-size: 12px; line-height: 16px; color: var(--ink2); }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink3); flex: none; }
+  .dot.green { background: var(--green); }
+  .link { all: unset; cursor: pointer; color: var(--accent); font-weight: 500; }
+  .link:hover { text-decoration: underline; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 2px; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border: 1px solid var(--line2); border-radius: 6px; font-size: 12px; background: var(--bg2); }
+  .chip.fixed { color: var(--ink3); }
+  .chip .x { color: var(--ink3); cursor: pointer; font-size: 13px; line-height: 1; }
+  .input { height: 28px; border: 1px solid var(--accent); box-shadow: 0 0 0 3px var(--accent-tint); border-radius: 8px; padding: 0 8px; font: 12px var(--sans); color: var(--ink); background: var(--card); width: 120px; outline: none; }
+  .btn { all: unset; cursor: pointer; height: 28px; padding: 0 10px; border-radius: 8px; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; }
+  .btn.primary { background: var(--accent-btn); color: #fff; }
+  .btn.ghost { color: var(--ink2); }
+
+  .msg { padding: 6px 0; }
+  .msg .who { font-weight: 600; font-size: 13px; }
+  .msg .when { color: var(--ink3); font-size: 12px; margin-left: 6px; }
+  .reply { margin-left: 16px; padding-left: 12px; border-left: 2px solid var(--line2); }
+
+  /* Phones */
+  .phones { display: grid; grid-template-columns: repeat(2, minmax(0, 360px)); gap: 32px; margin-top: 16px; }
+  .phone { background: #EDEDED; border-radius: 28px; border: 1px solid var(--line); overflow: hidden; color: #1D1D22; }
+  :root[data-theme="dark"] .phone { background: #111; color: #EDEDF2; border-color: var(--line2); }
+  .phone .bar { text-align: center; font-weight: 600; padding: 14px 0 10px; border-bottom: 1px solid rgba(0,0,0,.06); }
+  .phone .bar small { display: block; font-weight: 400; font-size: 11px; color: #8A8A93; }
+  .chat { padding: 10px 12px 16px; display: flex; flex-direction: column; gap: 8px; min-height: 420px; }
+  .b { display: flex; gap: 8px; align-items: flex-start; }
+  .av { width: 28px; height: 28px; border-radius: 6px; background: #C7C7CC; flex: none; display: grid; place-items: center; font-size: 12px; color: #fff; }
+  .av.alex { background: #9A7B0A; }
+  .bub { background: #fff; border-radius: 8px; padding: 6px 10px; max-width: 250px; font-size: 13px; line-height: 19px; }
+  :root[data-theme="dark"] .bub { background: #2C2C2C; }
+  .nm { font-size: 11px; color: #8A8A93; margin-bottom: 2px; }
+  .gap { align-self: center; font-size: 11px; color: #8A8A93; background: rgba(0,0,0,.05); padding: 1px 8px; border-radius: 6px; }
+  :root[data-theme="dark"] .gap { background: rgba(255,255,255,.08); }
+  .gap.slow { color: #C32C18; } :root[data-theme="dark"] .gap.slow { color: #F87A60; }
+  .gap.fast { color: #2F9E5A; } :root[data-theme="dark"] .gap.fast { color: #4CC38A; }
+
+  /* Site */
+  .site { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 16px; }
+  .point { padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+  .point h4 { margin: 0 0 4px; font-size: 15px; line-height: 21px; }
+  .point.old { opacity: .55; }
+  .shot { border: 1px dashed var(--line2); border-radius: 12px; padding: 16px; color: var(--ink2); background: var(--bg2); }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 16px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: left; vertical-align: top; padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 18px; }
+  th { color: var(--ink3); font-weight: 500; font-size: 12px; background: var(--bg2); }
+  tr:last-child td { border-bottom: 0; }
+  ul.plain { margin: 8px 0 0; padding-left: 18px; color: var(--ink2); }
+  ul.plain li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div>
+      <h1>群聊旁听 V2：要改的地方</h1>
+      <p class="lead">RFC 0001 的界面原型。控制台只改群展开后顶部的"听群里所有的话"那一块：多一个"回得多快"三档、一行现在的状态、一行"群里怎么叫它"。聊天软件里没有新界面，变化是回得更早、先说一句。官网在发布后换一段文案、补两张图。</p>
+    </div>
+    <div class="seg">
+      <button type="button" aria-pressed="true" data-theme-set="light">浅色</button>
+      <button type="button" aria-pressed="false" data-theme-set="dark">深色</button>
+    </div>
+  </header>
+
+  <!-- 1. Console -->
+  <h2>1. 控制台：群里"听群里所有的话"那一块</h2>
+  <p class="lead">位置不变：动态里展开一个群，顶部那一块。没有新页面、新弹窗、图表或数字统计。只对开着"听所有"的群显示，关掉时和现在一样只剩一行开关。</p>
+
+  <div class="grid">
+    <!-- A: today -->
+    <div class="frame">
+      <div class="label"><h3>现在（V1）</h3><span class="tag">对照</span></div>
+      <div class="card">
+        <div class="conv-head"><span class="app wechat">微</span><span class="conv-name">周末徒步群</span><span class="ink3 small grow">群聊</span><span class="ink3 small">现在</span><span class="chev">⌄</span></div>
+        <div class="conv-body">
+          <div class="listen">
+            <label class="row"><span class="text"><span class="title">听群里所有的话</span><span class="caption ink2">Alex 能看到群里的每条消息，有值得说的才开口。会多用一些额度。</span></span><input class="check" type="checkbox" checked></label>
+          </div>
+          <div class="msg"><span class="who">李雷</span><span class="when">2分钟前</span><p>Alex 你看下周六香山那条线行不行</p></div>
+          <div class="msg"><span class="who">李雷</span><span class="when">2分钟前</span><p>我们 6 个人，有两个第一次爬</p></div>
+          <div class="msg reply"><span class="who">Alex</span><span class="when">现在</span><p>行，香山北线适合新手……</p></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- B: V2 in conversation -->
+    <div class="frame">
+      <div class="label"><h3>V2 · 有人在和它聊</h3><span class="tag new">新</span></div>
+      <div class="card">
+        <div class="conv-head"><span class="app wechat">微</span><span class="conv-name">周末徒步群</span><span class="ink3 small grow">群聊</span><span class="ink3 small">现在</span><span class="chev">⌄</span></div>
+        <div class="conv-body">
+          <div class="listen">
+            <label class="row"><span class="text"><span class="title">听群里所有的话</span><span class="caption ink2">Alex 能看到群里的每条消息，有值得说的才开口。会多用一些额度。</span></span><input class="check" type="checkbox" checked></label>
+            <div class="row">
+              <span class="text"><span class="title">在聊时回得多快</span><span class="caption ink2">快：聊得正热时几十秒内接话，每小时最多多用约 12 轮。这个群人不多，默认用这一档。</span></span>
+              <span class="ctl seg sm"><button type="button" aria-pressed="false">省</button><button type="button" aria-pressed="false">均衡</button><button type="button" aria-pressed="true">快</button></span>
+            </div>
+            <div class="row">
+              <span class="text"><span class="title">群里怎么叫它</span>
+                <span class="chips"><span class="chip fixed">Alex</span><span class="chip">小跟班 <button type="button" class="x link" aria-label="删除">×</button></span><button class="link caption" type="button">添加</button></span>
+                <span class="caption ink2">没 @ 它、只在话里叫到这些称呼，也算在叫它。</span></span>
+            </div>
+            <p class="status"><span class="dot green"></span>正在和李雷聊，他说完就接话。</p>
+          </div>
+          <div class="msg"><span class="who">李雷</span><span class="when">1分钟前</span><p>小跟班你看下周六香山那条线行不行</p></div>
+          <div class="msg"><span class="who">李雷</span><span class="when">1分钟前</span><p>我们 6 个人，有两个第一次爬</p></div>
+          <div class="msg reply"><span class="who">Alex</span><span class="when">40秒前</span><p>我看一下天气和路况。</p></div>
+          <div class="msg reply"><span class="who">Alex</span><span class="when">现在</span><p>行，北线全程 12 公里，爬升 540 米，新手没问题……</p></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- C: listening -->
+    <div class="frame">
+      <div class="label"><h3>V2 · 没人在和它聊</h3><span class="tag new">新</span></div>
+      <div class="card">
+        <div class="conv-head"><span class="app feishu">飞</span><span class="conv-name">发布小组</span><span class="ink3 small grow">群聊</span><span class="ink3 small">12分钟前</span><span class="chev">⌄</span></div>
+        <div class="conv-body">
+          <div class="listen">
+            <label class="row"><span class="text"><span class="title">听群里所有的话</span><span class="caption ink2">Alex 能看到群里的每条消息，有值得说的才开口。会多用一些额度。</span></span><input class="check" type="checkbox" checked></label>
+            <div class="row">
+              <span class="text"><span class="title">在聊时回得多快</span><span class="caption ink2">均衡：比"快"慢一点，每小时最多多用约 6 轮。这个群人多，默认用这一档。</span></span>
+              <span class="ctl seg sm"><button type="button" aria-pressed="false">省</button><button type="button" aria-pressed="true">均衡</button><button type="button" aria-pressed="false">快</button></span>
+            </div>
+            <div class="row">
+              <span class="text"><span class="title">群里怎么叫它</span>
+                <span class="chips"><span class="chip fixed">Alex</span><button class="link caption" type="button">添加</button></span></span>
+            </div>
+            <p class="status"><span class="dot"></span>在旁听，大约每 2 分钟看一次。有人叫它就接上。</p>
+          </div>
+          <div class="msg"><span class="who">王芳</span><span class="when">12分钟前</span><p>今晚的构建谁来盯？</p></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- D: slowed / agent-set pace (existing lines, kept) -->
+    <div class="frame">
+      <div class="label"><h3>V2 · 它最近没开口，或自己调慢了</h3><span class="tag">沿用现有文案</span></div>
+      <div class="card">
+        <div class="conv-head"><span class="app tg">T</span><span class="conv-name">徒步俱乐部</span><span class="ink3 small grow">群聊</span><span class="ink3 small">1小时前</span><span class="chev">⌄</span></div>
+        <div class="conv-body">
+          <div class="listen">
+            <label class="row"><span class="text"><span class="title">听群里所有的话</span><span class="caption ink2">Alex 能看到群里的每条消息，有值得说的才开口。会多用一些额度。</span></span><input class="check" type="checkbox" checked></label>
+            <div class="row">
+              <span class="text"><span class="title">在聊时回得多快</span><span class="caption ink2">省：慢一些，每小时最多多用约 3 轮。</span></span>
+              <span class="ctl seg sm"><button type="button" aria-pressed="true">省</button><button type="button" aria-pressed="false">均衡</button><button type="button" aria-pressed="false">快</button></span>
+            </div>
+            <div class="row">
+              <span class="text"><span class="title">群里怎么叫它</span>
+                <span class="chips"><span class="chip fixed">Alex</span><input class="input" value="向导" aria-label="新称呼"><button class="btn primary" type="button">添加</button><button class="btn ghost" type="button">取消</button></span></span>
+            </div>
+            <p class="status"><span class="dot"></span>Alex 设为最多每 1 小时看一次。<button class="link" type="button">恢复默认</button></p>
+          </div>
+          <div class="msg"><span class="who">韩梅梅</span><span class="when">1小时前</span><p>下次活动定了吗</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <ul class="plain small">
+    <li><b>三档是一个分段控件</b>，选项只写"省 / 均衡 / 快"。下面一句说清选中那档的代价，数字只写"每小时最多多用约 N 轮"，不显示令牌、E 这类内部词。默认按群的人数选，说明里写"默认用这一档"；owner 选过之后这句话就不出现了。</li>
+    <li><b>状态行只有三种</b>，都用文字，不用颜色区分含义：正在和某人聊（绿点）/ 在旁听 / 慢下来了。"慢下来了"和 Agent 自己设的 <code>--every</code> / <code>--mute</code> 沿用现在的文案和"恢复默认"。多个人同时在聊时写"正在和李雷、韩梅梅聊"，超过两个人写"正在和 3 个人聊"。</li>
+    <li><b>群里怎么叫它</b>：第一项是 Agent 的名字，不能删。owner 原地添加或删除称呼（回车添加，Esc 取消），Agent 用 <code>chat alias</code> 加的也列在这里，后加的覆盖不了先删的。最多 8 个，每个最长 16 个字。</li>
+    <li><b>关掉"听所有"时</b>，三档、称呼和状态行都收起来，和现在一样只剩开关和一句"只有 @ Alex 或回复它时，它才回应"。私聊和话题不显示这一块。</li>
+  </ul>
+
+  <!-- 2. IM -->
+  <h2>2. 聊天软件里：没有新界面，只是回得更早</h2>
+  <p class="lead">同一段对话，左边是现在，右边是 V2。机制上的变化：在聊的人说完就交，不等 2 分钟间隔；提示语让它先回一句再动手、一条一个意思；对方在补充自己的话时，插进正在跑的那一轮。</p>
+  <div class="phones">
+    <div>
+      <p class="small ink2" style="margin-bottom:8px">现在：约 1 分 45 秒后，一大段</p>
+      <div class="phone">
+        <div class="bar">周末徒步群 (6)<small>微信</small></div>
+        <div class="chat">
+          <div class="b"><div class="av">李</div><div><div class="nm">李雷</div><div class="bub">小跟班你看下周六香山那条线行不行</div></div></div>
+          <div class="b"><div class="av">李</div><div><div class="nm">李雷</div><div class="bub">我们 6 个人，有两个第一次爬</div></div></div>
+          <div class="gap slow">1 分 45 秒</div>
+          <div class="b"><div class="av alex">A</div><div><div class="nm">Alex</div><div class="bub">行。周六晴，8–17°C，上午风小。北线全程 12 公里，爬升 540 米，有两个第一次爬的话，建议 7:30 北门集合，中午前下山，下午两点后西北风会大一些。装备：2 升水、冲锋衣、头灯……</div></div></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <p class="small ink2" style="margin-bottom:8px">V2：先回一句，再给结果</p>
+      <div class="phone">
+        <div class="bar">周末徒步群 (6)<small>微信</small></div>
+        <div class="chat">
+          <div class="b"><div class="av">李</div><div><div class="nm">李雷</div><div class="bub">小跟班你看下周六香山那条线行不行</div></div></div>
+          <div class="b"><div class="av">李</div><div><div class="nm">李雷</div><div class="bub">我们 6 个人，有两个第一次爬</div></div></div>
+          <div class="gap fast">约 25 秒</div>
+          <div class="b"><div class="av alex">A</div><div><div class="nm">Alex</div><div class="bub">我看一下天气和路况。</div></div></div>
+          <div class="b"><div class="av">李</div><div><div class="nm">李雷</div><div class="bub">对了是周日不是周六</div></div></div>
+          <div class="gap">它还在查，这句直接插进去</div>
+          <div class="b"><div class="av alex">A</div><div><div class="nm">Alex</div><div class="bub">周日晴，9–18°C。北线 12 公里、爬升 540 米，新手没问题。</div></div></div>
+          <div class="b"><div class="av alex">A</div><div><div class="nm">Alex</div><div class="bub">建议 7:30 北门集合，中午前下山，下午风会大。</div></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. Site -->
+  <h2>3. 官网：发布后改一段文案、补两张图</h2>
+  <p class="lead">只动"一个 Agent"那一节的一个要点和"和它说话"那一步，不新开版块。截图在发版后用 <code>site/scripts/screenshots.mjs</code> 和 <code>demo.mjs</code> 重拍，中英文、明暗各一套。</p>
+  <div class="site">
+    <div>
+      <p class="caption ink3" style="margin-bottom:8px">"一个 Agent"里的要点</p>
+      <div class="point old"><h4>听得见群里在聊什么</h4><p class="small ink2">群里的对话它当作背景留着，回答前先补看错过的消息。</p></div>
+      <div style="height:12px"></div>
+      <div class="point"><h4>跟得上群聊</h4><p class="small ink2">不用每句都 @ 它。有人和它聊起来，对方说完它就接话，先回一句再去办；和它无关的闲聊，它只是听着，也不乱花额度。</p></div>
+      <p class="caption ink3" style="margin:16px 0 8px">"和它说话"那一步</p>
+      <div class="point"><p class="small ink2">私聊它，或在群里 @ 它<b style="color:var(--ink)">、叫它的名字</b>。它一开始处理就会回应，回复边做边更新……</p></div>
+    </div>
+    <div class="shot">
+      <p class="small" style="font-weight:600;color:var(--ink);margin-bottom:6px">要补的两张图</p>
+      <ul class="plain small" style="margin-top:0">
+        <li><b>手机演示</b>：<code>demo.mjs</code> 加一个"在群里接着聊"的场景：不 @，叫一声"小跟班"，Alex 先回一句，再分两条给结果（上面右边那台手机）。中文用微信，英文用 Telegram，和第 3 步一致。</li>
+        <li><b>控制台截图</b>：<code>agent-*.png</code> 重拍，最新那个群默认展开，露出"在聊时回得多快"和"正在和李雷聊"这一行。</li>
+        <li><code>llms.txt</code> 里"reads group conversations as background"改为一句说明在聊时会跟上、不 @ 也能接话。</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- 4. Change list -->
+  <h2>4. 改动清单</h2>
+  <table>
+    <thead><tr><th style="width:22%">哪里</th><th>改什么</th><th style="width:16%">RFC 步骤</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/core/mingle.ts</code></td><td><code>overhear()</code> / <code>gap()</code> / <code>hear()</code>：按人算 E、只有在聊的人推动计时、两层令牌桶、被晾减半、30 条先留在聊的人；对方补充时插进正在跑的那一轮</td><td>1、3</td></tr>
+      <tr><td><code>src/core/format.ts</code>、<code>src/cli/manual.md</code></td><td><code>Heard</code> 在聊时加"先回一句、一条一个意思"；"X 连发了 4 条，要回就回一次"；指南加"可以分几条短消息"</td><td>2</td></tr>
+      <tr><td>存储（新迁移）</td><td><code>chats.hear_tier</code>（空 = 按人数默认）、<code>chats.aliases</code></td><td>1、4</td></tr>
+      <tr><td>本地 API</td><td><code>PUT …/chats/:chatId/hearing</code> 加 <code>{ tier }</code>；会话列表的 <code>hearing</code> 带 <code>tier</code>、<code>defaultTier</code>、<code>live</code>（正在和谁聊）、<code>aliases</code>；称呼的增删</td><td>1、4</td></tr>
+      <tr><td><code>mingle</code> CLI</td><td><code>chat alias &lt;chat&gt; add|remove &lt;称呼&gt;</code>（先写进 spec 第 5 节）；<code>chat info</code> 显示档位和称呼</td><td>4</td></tr>
+      <tr><td><code>web/src/AgentPage.tsx</code>、<code>i18n.ts</code></td><td><code>ListenSwitch</code> 加三档分段控件、状态行、称呼行；中英文文案</td><td>1、4</td></tr>
+      <tr><td><code>scripts/ui-review.mjs</code></td><td>新状态的截图：三档、在聊（一人 / 多人）、旁听、慢下来、添加称呼、长称呼、窄屏</td><td>1、4</td></tr>
+      <tr><td><code>docs/spec.md</code> 4.2、<code>DESIGN.md</code></td><td>4.2 从"已定，未实现"改成实际行为；DESIGN 的"最近活动"写进这一块的布局</td><td>1–4</td></tr>
+      <tr><td><code>site/</code></td><td>上面第 3 节：文案、演示场景、截图、<code>llms.txt</code></td><td>发布后</td></tr>
+    </tbody>
+  </table>
+</div>
+<script>
+  for (const b of document.querySelectorAll("[data-theme-set]")) {
+    b.addEventListener("click", () => {
+      document.documentElement.dataset.theme = b.dataset.themeSet;
+      for (const o of document.querySelectorAll("[data-theme-set]")) o.setAttribute("aria-pressed", String(o === b));
+    });
+  }
+  for (const g of document.querySelectorAll(".card .seg")) {
+    for (const b of g.querySelectorAll("button")) {
+      b.addEventListener("click", () => { for (const o of g.querySelectorAll("button")) o.setAttribute("aria-pressed", String(o === b)); });
+    }
+  }
+  if (new URLSearchParams(location.search).get("theme") === "dark") document.querySelector('[data-theme-set="dark"]').click();
+</script>
+</body>
+</html>

@@ -1,16 +1,19 @@
 # mingle.build
 
-The website: two static pages (English at `/`, Chinese at `/zh/`), `llms.txt` for AI agents, and real screenshots of the console. No framework; one generator script.
+The website: static pages in English and Chinese (`/` and `/zh/`, plus per-app integration guides at `/<app>/` and `/zh/<app>/`), `llms.txt` and `llms-full.txt` for AI agents, and real screenshots of the console. No framework; one generator script.
 
 ```text
-site/scripts/copy.mjs          every word on the site, en and zh; keep the two in step
+site/scripts/copy.mjs          every word on the homepage, en and zh; keep the two in step
+site/scripts/integrations.mjs  bilingual integration landing pages for all 10 platforms
+site/scripts/topics.mjs        bilingual harness guides (claude-code, codex, opencode, kimi-code), /security/ and /compare/
 site/scripts/harnesses.mjs     the harnesses on the Brains row, in the console's order
-site/scripts/demo.mjs          the homepage demo's scenes (one agent in Feishu, WeChat, Telegram, Discord), en and zh
-site/scripts/build.mjs         renders site/dist from copy.mjs and a release snapshot
+site/scripts/demo.mjs          the homepage demo's scenes (one agent in Feishu, WeChat, Telegram, Discord), en and zh; they play by themselves
+site/scripts/assets.mjs        converts site/img/*.png to WebP twins and renders 1200x630 Open Graph cards into site/img/og/
+site/scripts/build.mjs         renders site/dist from copy.mjs, integrations.mjs, topics.mjs and a release snapshot
 site/scripts/screenshots.mjs   seeds a throwaway Mingle and shoots the console into site/img, light and dark; refreshes site/icons from OAR
-site/scripts/review.sh         screenshots the built site at desktop and phone widths into .site-review/
+site/scripts/review.mjs        screenshots the built site section by section, desktop and phone, into .site-review/page/
 site/scripts/demo-review.mjs   plays every demo scene in headless Chrome, tapping Send, into .site-review/demo/
-site/styles.css, site/main.js  the look (DESIGN.md's tokens) and the few behaviors (OS download, copy, motion, the demo player)
+site/styles.css, site/main.js  the look (DESIGN.md's tokens) and the few behaviors (OS download, copy, motion, the phones, the demo player)
 site/wrangler.jsonc            deploys site/dist as a static-assets Worker on mingle.build and www.mingle.build
 ```
 
@@ -31,7 +34,7 @@ pnpm build && node site/scripts/screenshots.mjs   # only when the console change
 mkdir -p .site-review
 node scripts/releases.ts snapshot .site-review/latest-release.json   # freeze the published release
 node site/scripts/build.mjs --release .site-review/latest-release.json
-site/scripts/review.sh                            # look at every image in .site-review/
+node site/scripts/review.mjs                       # look at every image in .site-review/page/
 node site/scripts/demo-review.mjs [--motion]      # every demo scene must finish; look at .site-review/demo/
 ```
 

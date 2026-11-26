@@ -174,3 +174,37 @@ func TestQuitDetail(t *testing.T) {
 		t.Errorf("zh: %q", got)
 	}
 }
+
+func TestWatcherNotifiesWhatAnAgentSaysInItsPrivateChat(t *testing.T) {
+	en := enTexts()
+	var w watcher
+	now := time.Date(2026, 11, 22, 9, 0, 0, 0, time.UTC)
+	said := func(unread int, id, preview string) *summary {
+		a := agent("Alex", "idle", conn("n1", "telegram", "connected"))
+		a.Chat = &chatSummary{Unread: unread}
+		if id != "" {
+			a.Chat.Last = &chatLast{ID: id, Preview: preview}
+		}
+		return &summary{Agents: []agentSummary{a}}
+	}
+	// What was unread when the app started is not news.
+	if got := w.next(said(1, "m1", "old"), now, en); len(got) != 0 {
+		t.Fatalf("first look notified %v", got)
+	}
+	got := w.next(said(2, "m2", "Time to call the landlord."), now, en)
+	if len(got) != 1 || got[0].id != "chat:m2" || got[0].title != "Alex" || got[0].body != "Time to call the landlord." {
+		t.Fatalf("new private-chat message: %v", got)
+	}
+	// Once each, and nothing for what the owner has read.
+	if got := w.next(said(2, "m2", "Time to call the landlord."), now, en); len(got) != 0 {
+		t.Fatalf("notified again: %v", got)
+	}
+	if got := w.next(said(0, "", ""), now, en); len(got) != 0 {
+		t.Fatalf("read chat notified: %v", got)
+	}
+	// An older Mingle sends no chat at all.
+	plain := agent("Alex", "idle", conn("n1", "telegram", "connected"))
+	if got := w.next(&summary{Agents: []agentSummary{plain}}, now, en); len(got) != 0 {
+		t.Fatalf("no chat notified: %v", got)
+	}
+}

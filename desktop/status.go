@@ -21,7 +21,23 @@ type agentSummary struct {
 	Connections []connectionSummary `json:"connections"`
 	Failed      int                 `json:"failed"`
 	Unanswered  int                 `json:"unanswered"`
+	// Chat is what the agent said in its private chat that the owner has not seen
+	// (docs/spec.md 6.9); nil from a Mingle older than the private chat.
+	Chat *chatSummary `json:"chat"`
 }
+
+type chatSummary struct {
+	Unread int       `json:"unread"`
+	Last   *chatLast `json:"last"`
+}
+
+type chatLast struct {
+	ID      string `json:"id"`
+	Preview string `json:"preview"`
+}
+
+// chatNotePrefix marks a notification about the private chat: a click opens the chat.
+const chatNotePrefix = "chat:"
 
 type connectionSummary struct {
 	ID       string `json:"id"`
@@ -181,10 +197,13 @@ type note struct {
 	id, slug, title, body string
 }
 
-// watcher turns successive summaries into notifications: only what needs the owner,
-// each once. Answers reach people through the chat apps, which notify on their own.
+// watcher turns successive summaries into notifications: what needs the owner, each
+// once, and what an agent says in its private chat while the owner is not looking at it.
+// Answers in the chat apps reach people there, and those apps notify on their own.
 type watcher struct {
 	last *summary
+	// chat is the last private-chat message of each agent already seen or notified.
+	chat map[string]string
 	// down is when each connection started reconnecting; told is whether that was notified.
 	down map[string]time.Time
 	told map[string]bool
@@ -195,6 +214,9 @@ const downFor = 5 * time.Minute
 func (w *watcher) next(s *summary, now time.Time, t texts) []note {
 	if w.down == nil {
 		w.down, w.told = map[string]time.Time{}, map[string]bool{}
+	}
+	if w.chat == nil {
+		w.chat = map[string]string{}
 	}
 	before := map[string]connectionSummary{}
 	failed := map[string]int{}
@@ -211,6 +233,14 @@ func (w *watcher) next(s *summary, now time.Time, t texts) []note {
 	var out []note
 	seen := map[string]bool{}
 	for _, a := range s.Agents {
+		// The console counts what arrives while the owner reads the chat as seen, so this is
+		// only what came while they were elsewhere. What was there when the app started is not news.
+		if a.Chat != nil && a.Chat.Unread > 0 && a.Chat.Last != nil && w.chat[a.ID] != a.Chat.Last.ID {
+			if !first {
+				out = append(out, note{chatNotePrefix + a.Chat.Last.ID, a.Slug, a.Name, a.Chat.Last.Preview})
+			}
+			w.chat[a.ID] = a.Chat.Last.ID
+		}
 		if !first && a.Failed > failed[a.ID] {
 			out = append(out, note{"failed:" + a.ID, a.Slug, t.failedTitle(a.Name), t.failedBody})
 		}

@@ -19,6 +19,7 @@ import type {
   SendResult,
 } from "../channel.ts";
 import { withTextSent } from "../channel.ts";
+import { type Mention, mentionSpots } from "../mention.ts";
 
 /** Telegram Bot API, long polling. No webhook, so no public address is needed. */
 
@@ -99,6 +100,7 @@ const CAPABILITIES: Capabilities = {
   fileUpload: true,
   fileDownload: true,
   listMembers: false,
+  mentions: true,
   maxTextLength: 4096,
 };
 
@@ -143,6 +145,7 @@ export function telegramChannel(options: TelegramOptions = {}): Channel {
 
   return {
     platform: "telegram",
+    groupMessages: true,
     // A deep link sends `/start <code>` from the person's own account with one tap.
     claimUrl(bot: BotIdentity, code: string) {
       return `https://t.me/${encodeURIComponent(bot.name.replace(/^@/, ""))}?start=${code}`;
@@ -278,7 +281,11 @@ export function telegramChannel(options: TelegramOptions = {}): Channel {
           try {
             let lastId = "";
             if (message.text) {
-              const sent = await api.call<TgMessage>("sendMessage", { ...base, text: message.text });
+              const sent = await api.call<TgMessage>("sendMessage", {
+                ...base,
+                text: message.text,
+                ...mentionEntities(message.text, message.mentions),
+              });
               lastId = textId = String(sent.message_id);
             }
             for (const file of message.files ?? []) {
@@ -318,8 +325,13 @@ export function telegramChannel(options: TelegramOptions = {}): Channel {
             reply_parameters: { message_id: Number(options.replyTo), allow_sending_without_reply: true },
             text: plain(options.initial),
           });
-          const edit = (text: string) =>
-            api.call("editMessageText", { chat_id: chatId, message_id: placeholder.message_id, text });
+          const edit = (text: string, mentions?: readonly Mention[]) =>
+            api.call("editMessageText", {
+              chat_id: chatId,
+              message_id: placeholder.message_id,
+              text,
+              ...mentionEntities(text, mentions),
+            });
           let last = plain(options.initial);
           return {
             update: async (markdown) => {
@@ -328,9 +340,9 @@ export function telegramChannel(options: TelegramOptions = {}): Channel {
               last = text;
               await edit(text).catch(() => {});
             },
-            finish: async (markdown) => {
+            finish: async (markdown, mentions) => {
               try {
-                await edit(plain(markdown));
+                await edit(plain(markdown), mentions);
                 return { kind: "sent", platformId: String(placeholder.message_id), degraded: ["markdown_flattened"] };
               } catch (error) {
                 return sendFailure(error);
@@ -365,6 +377,17 @@ export function telegramChannel(options: TelegramOptions = {}): Channel {
 }
 
 /** Mingle's progress text uses **bold** and *italic*; Telegram gets it as plain text. */
+/** Plain text names a person by ID with a `text_mention` entity over the written `@name`. */
+function mentionEntities(text: string, mentions: readonly Mention[] | undefined) {
+  const entities = mentionSpots(text, mentions?.filter((m) => /^\d+$/.test(m.id)) ?? []).map((spot) => ({
+    type: "text_mention",
+    offset: spot.start,
+    length: spot.end - spot.start,
+    user: { id: Number(spot.mention.id) },
+  }));
+  return entities.length ? { entities } : {};
+}
+
 function plain(markdown: string): string {
   return markdown.replace(/\*\*(.+?)\*\*/g, "$1").replace(/(^|\s)\*(\S.*?)\*(?=\s|$)/g, "$1$2");
 }

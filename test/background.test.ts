@@ -33,6 +33,28 @@ describe("background messages", () => {
     return { store, connectionId, say, speak };
   }
 
+  it("reads what came before a message, even one stored in the same millisecond", () => {
+    const { store, connectionId } = setup();
+    const group = store.upsertChat({ connectionId, platformId: "G", kind: "group" });
+    const at = (body: string) =>
+      store.insertInbound({
+        chatId: group.id,
+        platformId: body,
+        senderId: "U1",
+        senderName: "Zhang San",
+        body,
+        attachments: [],
+        replyTo: null,
+        triggers: false,
+        createdAt: 5000,
+      }) as NonNullable<ReturnType<Store["insertInbound"]>>;
+    at("first");
+    const second = at("second");
+    at("third");
+    expect(store.chatMessages(group.id, 10, second.id).map((m) => m.body)).toEqual(["first"]);
+    expect(store.chatMessages(group.id, 10).map((m) => m.body)).toEqual(["first", "second", "third"]);
+  });
+
   it("counts what was said in a group since the agent last spoke there", () => {
     const { store, connectionId, say, speak } = setup();
     const group = store.upsertChat({ connectionId, platformId: "G", kind: "group", name: "Hikes" });

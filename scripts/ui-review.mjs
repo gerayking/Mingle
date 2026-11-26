@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -21,13 +21,14 @@ const OUT = resolve(".ui-review");
 const PORT = 7490 + Math.floor(Math.random() * 100);
 // Desktop Chrome will not lay out narrower than 500 px, so smaller widths only crop the image.
 const WIDTHS = (process.env.WIDTHS ?? "1440,1024,760,560").split(",").map(Number);
+const CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.UI_CONCURRENCY) || 4));
 const LOCALES = ["en-US", "zh-CN"];
 
 const home = mkdtempSync(join(tmpdir(), "mingle-ui-"));
 const ENV_SECRET = "ui-review-not-a-real-secret";
 /** Run before the daemon stops: undo what the review put outside its own folder. */
 const cleanups = [];
-rmSync(OUT, { recursive: true, force: true });
+if (!process.env.UI_REMOTE_ONLY) rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
 
 const daemon = spawn(process.execPath, ["dist/cli/main.js", "start", "--port", String(PORT), "--no-open"], {
@@ -125,7 +126,18 @@ try {
   conn("n4", long.id, "discord", "Wilhelmina#4242", "connected", null, null);
   conn("n9", alex.id, "telegram", "@alex_second_bot", "reconnecting", null, "u1");
   insert(
-    "INSERT INTO chats (id, connection_id, platform_id, kind, name, created_at, updated_at) VALUES ('c1','n1','-1','group','周末徒步 · 北京西山与香山常走路线交流群',?,?)",
+    "INSERT INTO chats (id, connection_id, platform_id, kind, name, listen, hear_tier, aliases, created_at, updated_at) VALUES ('c1','n1','-1','group','周末徒步 · 北京西山与香山常走路线交流群',1,'save',?,?,?)",
+    // Every name a group may give it (docs/spec.md 4.2): eight, the longest 16 characters, so "Add" is gone.
+    JSON.stringify([
+      "小跟班",
+      "向导",
+      "trail buddy",
+      "Xiangshan Leader",
+      "北京西山香山常走路线向导小助手",
+      "Alexandrovna",
+      "老A",
+      "hiking helper",
+    ]),
     now,
     now,
   );
@@ -187,6 +199,16 @@ try {
     120_000,
     JSON.stringify([{ id: "f1", ref: "x", name: "route-map-xiangshan-north-loop-final-v3.gpx" }]),
   );
+  // A thread under the group: the activity nests it under its channel.
+  insert(
+    "INSERT INTO chats (id, connection_id, platform_id, kind, name, parent_id, created_at, updated_at) VALUES ('c12','n1','-1:5','thread','香山北线装备清单与补给点（第二版，含末班车时间）','c1',?,?)",
+    now,
+    now,
+  );
+  msg("m0t1", "c12", "in", "李四", "@Alex 北线中途有补水的地方吗？", "replied", 2_400_000);
+  msg("m0t2", "c12", "out", null, "半山亭有小卖部，冬季 16:00 关门。", "sent", 2_350_000);
+  msg("m0t3", "c12", "in", "李四", "@Alex 那末班车几点？", "replied", 600_000);
+  msg("m0t4", "c12", "out", null, "冬季末班车 17:30，从香山公园北门发车。", "sent", 590_000);
   insert(
     "INSERT INTO tasks (id, agent_id, title, status, created_at, updated_at) VALUES ('t1', ?, '比较三条备选路线的爬升、距离和交通，周五前给出推荐', 'in_progress', ?, ?)",
     alex.id,
@@ -198,6 +220,39 @@ try {
     alex.id,
     now,
     now,
+  );
+  // Work Alex does beside the conversation (docs/spec.md 4.13): one under way, one waiting its turn,
+  // one done today. Inserted after the daemon started, so nothing tries to run them.
+  const line = (id, title, state, status, from, chat, ago, summary = null) =>
+    insert(
+      "INSERT INTO tasks (id, agent_id, title, status, from_message, from_chat, line_state, brief, summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'brief', ?, ?, ?)",
+      id,
+      alex.id,
+      title,
+      status,
+      from,
+      chat,
+      state,
+      summary,
+      now - ago,
+      now - ago / 2,
+    );
+  line("t5", "整理香山北线、西山和八大处三条路线的爬升和交通对比表", "running", "in_progress", "m01", "c1", 720_000);
+  // How far it is: the first line of what it last said in its thread, long enough to truncate.
+  insert(
+    "UPDATE tasks SET progress = ? WHERE id = 't5'",
+    "西山和八大处的爬升数据已经齐了，香山北线还在核对公交末班车时间和北门开放时间，整理好后发到群里",
+  );
+  line("t6", "Draft the packing list for first-time hikers", "queued", "in_progress", "m03", "c2", 120_000);
+  line(
+    "t7",
+    "Check the bus timetable",
+    "idle",
+    "done",
+    "m0t3",
+    "c12",
+    3_000_000,
+    "Winter last bus 17:30 from the north gate; summer 19:00. Source: the park's notice board, checked today.",
   );
   insert(
     "INSERT INTO reminders (id, agent_id, body, rule, timezone, next_fire_at, created_at) VALUES ('r1', ?, '在群里提醒周六 7:30 香山公园北门集合，并确认人数', 'once', 'Asia/Shanghai', ?, ?)",
@@ -238,6 +293,34 @@ try {
     now + 3 * 3_600_000,
     now - 21 * 3_600_000,
     now - 7 * 86_400_000,
+  );
+  // Reminders that fire on change: the command under the times; one that keeps failing says so.
+  insert(
+    "INSERT INTO reminders (id, agent_id, body, rule, timezone, next_fire_at, last_fired_at, created_at, check_command, check_once, check_output, last_checked_at) VALUES ('r3', ?, 'CI on PR 141 finished: tell the group how it went and link the failing job if any', 'every:2m', 'Asia/Shanghai', ?, ?, ?, ?, 1, 'pending', ?)",
+    alex.id,
+    now + 120_000,
+    now - 2 * 3_600_000,
+    now - 3 * 3_600_000,
+    "gh pr checks 141 -R earayu/Mingle --json bucket -q 'map(.bucket) | unique | join(\",\")'",
+    now,
+  );
+  insert(
+    "INSERT INTO reminders (id, agent_id, body, rule, timezone, next_fire_at, created_at, check_command, check_failures, check_error, last_checked_at) VALUES ('r4', ?, '香山公园官网的开放时间变了就告诉群里', 'every:1h', 'Asia/Shanghai', ?, ?, ?, 4, ?, ?)",
+    alex.id,
+    now + 3_600_000,
+    now - 86_400_000,
+    "curl -fsSL https://www.xiangshanpark.com.cn/notice | shasum",
+    "exited with 6",
+    now - 5 * 60_000,
+  );
+  insert(
+    "INSERT INTO reminders (id, agent_id, body, rule, timezone, next_fire_at, created_at, check_command, check_failures, check_error, last_checked_at) VALUES ('r5', ?, 'Notify when the new weather feed updates', 'every:15m', 'Asia/Shanghai', ?, ?, ?, 1, ?, ?)",
+    alex.id,
+    now + 15 * 60_000,
+    now - 4 * 3_600_000,
+    "curl -fsSL https://api.weather.example/feed | shasum",
+    "timed out after 60s",
+    now - 2 * 60_000,
   );
   insert(
     "UPDATE agents SET status = 'working', status_detail = 'Bash: curl -s https://api.weather.example/forecast?lat=39.99&lon=116.19' WHERE id = ?",
@@ -416,34 +499,111 @@ try {
   insert("UPDATE agents SET status = 'idle' WHERE id = ?", offAgent.id);
   insert("UPDATE agents SET status = 'idle' WHERE id = ?", doneAgent.id);
   insert("UPDATE agents SET status = 'idle', has_replied = 1 WHERE id = ?", lonelyAgent.id);
+  // The private chat (docs/spec.md 6.9): Alex's has history in every shape; Poppy's is empty.
+  const localOf = (agent) =>
+    db.prepare("SELECT id FROM connections WHERE agent_id = ? AND platform = 'local'").get(agent)?.id;
+  insert(
+    "INSERT INTO chats (id, connection_id, platform_id, kind, created_at, updated_at) VALUES ('cL', ?, 'owner', 'dm', ?, ?)",
+    localOf(alex.id),
+    now,
+    now,
+  );
+  const files = join(home, "uploads", alex.id, "review");
+  mkdirSync(files, { recursive: true });
+  writeFileSync(join(files, "trail-photo.png"), gradientPng(320));
+  writeFileSync(join(files, "Xiangshan north loop, winter timetable and packing notes (final).pdf"), "%PDF-1.4");
+  const local = (id, dir, body, state, ago, attachments = null) =>
+    insert(
+      "INSERT INTO messages (id, chat_id, direction, platform_id, sender_id, sender_name, body, attachments, triggers, state, created_at) VALUES (?, 'cL', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id,
+      dir,
+      id,
+      dir === "in" ? "owner" : null,
+      dir === "in" ? "owner" : null,
+      body,
+      attachments,
+      dir === "in" ? 1 : 0,
+      state,
+      now - ago,
+    );
+  local("mL1", "in", "明早 9 点提醒我给房东转房租", "replied", 26 * 3_600_000);
+  local("mL2", "out", "好的，明天 09:00 提醒你转房租。", "sent", 26 * 3_600_000 - 30_000);
+  local("mL3", "in", "群里今天早上定了什么？顺便把三条路线对比一下", "replied", 3_000_000);
+  local(
+    "mL4",
+    "out",
+    "今天早上定了三件事：\n\n- 周六 **7:30** 香山公园北门集合\n- 李雷负责买 `12` 个人的保险\n- 下雨就改去八大处\n\n| 路线 | 距离 | 爬升 |\n| --- | --- | --- |\n| 香山北线 | 12 km | 540 m |\n| 西山 | 15 km | 720 m |\n\n原话在 [群聊记录](https://example.com/chat) 里，三条路线的完整对比我在旁边整理。",
+    "sent",
+    2_990_000,
+  );
+  insert("UPDATE tasks SET from_message = 'mL3', from_chat = 'cL' WHERE id = 't5'");
+  local(
+    "mL5",
+    "in",
+    "这张照片里是哪条路？",
+    "replied",
+    1_200_000,
+    JSON.stringify([
+      { id: "fL1", ref: join(files, "trail-photo.png"), name: "trail-photo.png", size: 4096, mime: "image/png" },
+    ]),
+  );
+  local(
+    "mL6",
+    "out",
+    "是香山北线半山亭附近。冬季时刻表和装备清单我整理成了一份文件：",
+    "sent",
+    1_150_000,
+    JSON.stringify([
+      {
+        id: "fL2",
+        ref: join(files, "Xiangshan north loop, winter timetable and packing notes (final).pdf"),
+        name: "Xiangshan north loop, winter timetable and packing notes (final).pdf",
+        size: 1_284_000,
+      },
+    ]),
+  );
+  local("mL7", "in", "周六要是下雨还去吗？", "failed", 600_000);
+  local(
+    "mL8",
+    "in",
+    "Could you also check the weather on Sunday, and what time sunrise is at the north gate?",
+    "delivered",
+    20_000,
+  );
+
   db.close();
 
-  const pages = [
-    ["agent", `/a/${alex.slug}`],
-    ["long", `/a/${long.slug}`],
-    ["new", "/new"],
-    ["home", "/"],
-    ["settings", "/settings"],
-    // The QR step is not here: it needs a live call to the platform, which headless Chrome's
-    // virtual clock outruns. Check it in the desktop app (desktop/README.md) instead.
-    ["connect", `/a/${long.slug}/connect`],
-    ["connect-counts", `/a/${alex.slug}/connect`],
-    ["connect-slack", `/a/${long.slug}/connect/slack`],
-    ["connect-discord", `/a/${long.slug}/connect/discord`],
-    ["connect-telegram", `/a/${alex.slug}/connect/telegram`],
-    // The token guide. Signing in with a code asks GitHub for a live code, so it is checked by hand.
-    ["connect-github", `/a/${long.slug}/connect/github`],
-    // Live checks of this Mac's own permissions; read-only, they never make macOS ask anything.
-    ...(process.platform === "darwin" ? [["connect-imessage", `/a/${alex.slug}/connect/imessage`]] : []),
-    ["onboard-idle", `/a/${idleAgent.slug}`],
-    ["onboard-busy", `/a/${busyAgent.slug}`],
-    ["onboard-offline", `/a/${offAgent.slug}`],
-    ["onboard-done", `/a/${doneAgent.slug}`],
-    ["no-bot", `/a/${lonelyAgent.slug}`],
-    ["paused", `/a/${pausedAgent.slug}`],
-    ["shared-wechat", `/a/${sharedAgent.slug}`],
-    ["claim", `/a/${claimAgent.slug}`],
-  ];
+  const pages = process.env.UI_REMOTE_ONLY
+    ? []
+    : [
+        ["agent", `/a/${alex.slug}`],
+        ["chat", `/a/${alex.slug}/chat`],
+        ["chat-empty", `/a/${idleAgent.slug}/chat`],
+        ["chat-paused", `/a/${pausedAgent.slug}/chat`],
+        ["long", `/a/${long.slug}`],
+        ["new", "/new"],
+        ["home", "/"],
+        ["settings", "/settings"],
+        // The QR step is not here: it needs a live call to the platform, which headless Chrome's
+        // virtual clock outruns. Check it in the desktop app (desktop/README.md) instead.
+        ["connect", `/a/${long.slug}/connect`],
+        ["connect-counts", `/a/${alex.slug}/connect`],
+        ["connect-slack", `/a/${long.slug}/connect/slack`],
+        ["connect-discord", `/a/${long.slug}/connect/discord`],
+        ["connect-telegram", `/a/${alex.slug}/connect/telegram`],
+        // The token guide. Signing in with a code asks GitHub for a live code, so it is checked by hand.
+        ["connect-github", `/a/${long.slug}/connect/github`],
+        // Live checks of this Mac's own permissions; read-only, they never make macOS ask anything.
+        ...(process.platform === "darwin" ? [["connect-imessage", `/a/${alex.slug}/connect/imessage`]] : []),
+        ["onboard-idle", `/a/${idleAgent.slug}`],
+        ["onboard-busy", `/a/${busyAgent.slug}`],
+        ["onboard-offline", `/a/${offAgent.slug}`],
+        ["onboard-done", `/a/${doneAgent.slug}`],
+        ["no-bot", `/a/${lonelyAgent.slug}`],
+        ["paused", `/a/${pausedAgent.slug}`],
+        ["shared-wechat", `/a/${sharedAgent.slug}`],
+        ["claim", `/a/${claimAgent.slug}`],
+      ];
   const checkPlatformCounts = (dom, zh, expected) => {
     const buttons = [...dom.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)].map((match) => match[0]);
     for (const [platform, count] of expected) {
@@ -467,6 +627,17 @@ try {
     // Alex answered long ago (m02/m04): no onboarding card.
     agent: (dom, zh) => {
       assert.ok(dom.includes("Saturday") || dom.includes("周六晴"), "agent activity did not render");
+      // A group that hears everything: the tier the owner picked, the names it is called by, what it does now.
+      assert.ok(dom.includes(zh ? "在聊时回得多快" : "Keeping up in a conversation"), "hearing tier missing");
+      assert.ok(
+        dom.includes(zh ? "省：最多攒 2 次快速查看" : "Save: up to 2 quick looks"),
+        "picked tier not explained",
+      );
+      assert.ok(dom.includes(zh ? "群里怎么叫它" : "What the group calls it"), "group names missing");
+      assert.ok(dom.includes("Xiangshan Leader"), "a group name is not shown");
+      assert.ok(dom.includes(zh ? "在旁听" : "Listening in"), "hearing status missing");
+      assert.ok(dom.includes(zh ? "在做 2 件事" : "2 under way"), "work under way not counted");
+      assert.ok(dom.includes(zh ? "排队中" : "Queued"), "queued work not shown");
       assert.ok(!dom.includes(zh ? "上手" : "Getting started"), "answered agent still shows onboarding");
       assert.ok(
         new RegExp(`<button[^>]*>\\s*${zh ? "忽略" : "Ignore"}\\s*</button>`).test(dom),
@@ -515,6 +686,28 @@ try {
       assert.ok(dom.includes("Maximiliana"), "named owner not shown by name");
       assert.ok(!/>\s*(你|You)\s*</.test(dom), "an owner shared between two people shows as you");
     },
+    chat: (dom, zh) => {
+      assert.ok(dom.includes("<table"), "the agent's Markdown table did not render");
+      assert.ok(dom.includes("<strong"), "the agent's bold text did not render");
+      assert.ok(dom.includes("trail-photo.png"), "the owner's picture is missing");
+      assert.ok(
+        dom.includes(zh ? "在访达中显示" : "Show in Finder") || process.platform !== "darwin",
+        "no reveal action",
+      );
+      assert.ok(dom.includes(zh ? "开始做" : "Started:"), "the work a message started is missing");
+      assert.ok(dom.includes(zh ? "出错，未回复" : "Failed to reply"), "the failed message does not say so");
+      assert.ok(!dom.includes("**"), "raw Markdown shows");
+    },
+    "chat-empty": (dom, zh) => {
+      assert.ok(
+        dom.includes(zh ? "在这台电脑上和 Poppy 私聊" : "Chat with Poppy on this computer"),
+        "empty chat has no title",
+      );
+    },
+    "chat-paused": (dom, zh) => {
+      assert.ok(dom.includes(zh ? "已暂停" : "is paused"), "paused chat does not say so");
+      assert.ok(/<textarea[^>]*disabled/.test(dom), "a paused agent's chat takes messages");
+    },
     paused: (dom, zh) => {
       assert.ok(dom.includes(zh ? "已暂停" : "is paused"), "paused agent does not say so");
       assert.ok(
@@ -561,7 +754,7 @@ try {
       for (const [name, path] of pages) {
         const file = join(OUT, `${locale}-${width}-${name}.png`);
         const profile = mkdtempSync(join(tmpdir(), "mingle-chrome-"));
-        // Thunks, so only four Chromes run at a time.
+        // Thunks keep browser memory bounded; lower concurrency on busy development machines.
         const shoot = () =>
           run(
             CHROME,
@@ -598,7 +791,8 @@ try {
       }
     }
   }
-  for (let i = 0; i < jobs.length; i += 4) await Promise.all(jobs.slice(i, i + 4).map((job) => job()));
+  for (let i = 0; i < jobs.length; i += CONCURRENCY)
+    await Promise.all(jobs.slice(i, i + CONCURRENCY).map((job) => job()));
   console.log(`${jobs.length} screenshots in ${OUT}`);
 
   // Static shots never click: run the live-browser checks for menus and Manage.

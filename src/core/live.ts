@@ -2,6 +2,7 @@ import type {
   ChannelConnection,
   ChatRef,
   LiveReply,
+  Mention,
   Platform,
   ReactionState,
   SendResult,
@@ -31,7 +32,8 @@ const TEXT = {
     seconds: (n: number) => `${n} 秒`,
     minutes: (m: number, s: number) => `${m} 分 ${s} 秒`,
     answeredBelow: "已回复，见下方消息。",
-    unanswered: "这条消息没有得到回复。",
+    continuing: "还在处理，完成后另发一条消息回复。",
+    unanswered: "暂未回复。",
     stopped: "已叫停。",
     paused: "已暂停，这条消息不会再回复。",
     pausedNote: (name: string) => `${name} 已暂停，暂时不回复消息。`,
@@ -77,7 +79,8 @@ const TEXT = {
     seconds: (n: number) => `${n}s`,
     minutes: (m: number, s: number) => `${m}m ${s}s`,
     answeredBelow: "Answered below.",
-    unanswered: "This message did not get a reply.",
+    continuing: "Still working on it. The answer will come as a new message.",
+    unanswered: "No reply yet.",
     stopped: "Stopped.",
     paused: "Paused. This message won't get a reply.",
     pausedNote: (name: string) => `${name} is paused and not replying for now.`,
@@ -259,6 +262,11 @@ interface Entry {
   lastRender: number;
   pending: NodeJS.Timeout | undefined;
   tick: NodeJS.Timeout | undefined;
+  /**
+   * The one adapter call in flight (opening the live reply plus a progress write, or the handover
+   * finish). While it runs, later renders are dropped; answer/settle drain it before finishing.
+   */
+  inFlight: Promise<void> | undefined;
   closed: boolean;
 }
 
@@ -299,6 +307,7 @@ export class LiveReplies {
       lastRender: 0,
       pending: undefined,
       tick: undefined,
+      inFlight: undefined,
       closed: false,
     };
     if (connection.startLive) {
@@ -338,15 +347,18 @@ export class LiveReplies {
    * The agent answered this message. If a live reply is open, the answer goes into it
    * and its result is returned; otherwise undefined, and the caller sends normally.
    */
-  async answer(messageId: string, markdown: string): Promise<SendResult | undefined> {
+  async answer(messageId: string, markdown: string, mentions?: readonly Mention[]): Promise<SendResult | undefined> {
     const entry = this.entries.get(messageId);
     if (!entry || entry.closed) return undefined;
     this.close(entry, messageId);
     void entry.connection.react(entry.chat, entry.platformMessageId, "done").catch(() => {});
+    // A progress write may still be in flight (a render, or the handover's "still working" finish):
+    // it lands first, then this reads whatever entry.live points at now.
+    await entry.inFlight;
     const live = await entry.live;
     if (!live) return undefined;
     try {
-      const result = await live.finish(markdown);
+      const result = await live.finish(markdown, mentions?.length ? mentions : undefined);
       return result.kind === "sent" ? result : undefined;
     } catch (error) {
       this.log(`live reply could not finish: ${(error as Error).message}`);
@@ -382,7 +394,8 @@ export class LiveReplies {
               : outcome === "waiting" && why
                 ? waitingText(entry.lang, why, this.now())
                 : failureText(entry.lang, why, this.now());
-    void entry.live
+    void Promise.resolve(entry.inFlight)
+      .then(() => entry.live)
       .then(async (live) => {
         const result = live ? await live.finish(`*${note}*`).catch(() => undefined) : undefined;
         // No live reply, or it could not be finished (QQ's stream window, a refused frame):
@@ -420,15 +433,37 @@ export class LiveReplies {
   }
 
   private schedule(entry: Entry): void {
-    if (entry.closed || entry.pending) return;
+    // A slow adapter can hold one write for seconds; while it runs, renders due in between are
+    // dropped rather than queued, so a burst of progress cannot pile up behind the connection.
+    // Activity still lands on the entry: the next render carries it.
+    if (entry.closed || entry.pending || entry.inFlight) return;
     const wait = Math.max(0, entry.lastRender + RENDER_EVERY_MS - this.now());
     entry.pending = setTimeout(() => {
       entry.pending = undefined;
-      if (entry.closed) return;
+      if (entry.closed || entry.inFlight) return;
       entry.lastRender = this.now();
       const content = this.render(entry);
-      void entry.live.then((live) => live?.update(content)).catch(() => {});
+      entry.inFlight = entry.live
+        .then((live) => {
+          if (entry.closed) return;
+          if (live?.until === undefined || this.now() < live.until) return live?.update(content);
+          return this.handOver(entry, live);
+        })
+        .catch(() => {})
+        .finally(() => {
+          entry.inFlight = undefined;
+        });
     }, wait);
+  }
+
+  /**
+   * The platform is about to stop taking updates to the live reply: close it with a note while it
+   * still can, and let the answer go out as a message of its own.
+   */
+  private async handOver(entry: Entry, live: LiveReply): Promise<void> {
+    entry.live = Promise.resolve(undefined);
+    clearInterval(entry.tick);
+    await live.finish(`*${TEXT[entry.lang].continuing}*`);
   }
 
   /** The progress shown while the agent works. */

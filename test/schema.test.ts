@@ -53,6 +53,14 @@ describe("initial schema", () => {
     expect(db.prepare("SELECT count(*) AS n FROM messages").get()?.n).toBe(0);
     expect(search(db, "ridge")).toEqual([]);
   });
+
+  it("uses unique, sequential version numbers for all migration files", () => {
+    const files = readdirSync(new URL("../src/store/migrations/", import.meta.url))
+      .filter((f) => /^\d+_.+\.sql$/.test(f))
+      .sort();
+    const versions = files.map((f) => Number.parseInt(f, 10));
+    expect(versions).toEqual(files.map((_, i) => i + 1));
+  });
 });
 
 describe("onboarding completion", () => {
@@ -136,7 +144,7 @@ describe("onboarding completion", () => {
       expect(store.agent(a2.id)?.hasReplied).toBe(true);
 
       // Removing the connection (and its history) keeps the milestone; so do later failures.
-      store.deleteConnection(store.connections(a1.id)[0]?.id as string);
+      store.deleteConnection(store.connections(a1.id).filter((n) => n.platform !== "local")[0]?.id as string);
       expect(store.agent(a1.id)?.hasReplied).toBe(true);
       const again = store.insertOutbound({ chatId: c2.id, body: "late", replyTo: null });
       store.setOutboundResult(again.id, "failed", null);
@@ -278,6 +286,87 @@ describe("contacts", () => {
       expect(store.contact(first.id)).toBeUndefined();
     } finally {
       store.close();
+    }
+  });
+});
+
+describe("reminder check privacy", () => {
+  it("clears raw check output and error text left by older versions", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mingle-schema-"));
+    const path = join(dir, "mingle.db");
+    try {
+      const db = new DatabaseSync(path);
+      db.exec(schema);
+      for (let v = 2; v <= 22; v++) {
+        const file = readdirSync(new URL("../src/store/migrations/", import.meta.url)).find((f) =>
+          f.startsWith(`${String(v).padStart(3, "0")}_`),
+        ) as string;
+        db.exec(readFileSync(new URL(`../src/store/migrations/${file}`, import.meta.url), "utf8"));
+      }
+      db.exec(`
+        PRAGMA user_version = 22;
+        INSERT INTO agents (id, slug, name, harness, created_at, updated_at) VALUES ('a_1', 'alex', 'Alex', 'claude', 0, 0);
+        INSERT INTO reminders (id, agent_id, body, rule, timezone, next_fire_at, created_at, check_command, check_hash, check_output, check_error)
+          VALUES ('r1', 'a_1', 'watch CI', 'every:5m', 'UTC', 1, 0, 'gh pr checks 1', 'abc', 'raw output with a token', 'raw error with a token');
+        INSERT INTO reminders (id, agent_id, body, rule, timezone, next_fire_at, created_at)
+          VALUES ('r2', 'a_1', 'plain', 'once', 'UTC', 1, 0);
+      `);
+      db.close();
+
+      const store = new Store(path);
+      try {
+        const rows = store.db
+          .prepare("SELECT id, check_output, check_error, check_hash FROM reminders ORDER BY id")
+          .all() as Record<string, unknown>[];
+        expect(rows[0]).toMatchObject({ id: "r1", check_output: null, check_error: null, check_hash: "abc" });
+        expect(rows[1]).toMatchObject({ id: "r2", check_output: null, check_error: null });
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("teams removed (027)", () => {
+  it("frees members, gives their open tasks back with a note, and drops team chats", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mingle-schema-"));
+    const path = join(dir, "mingle.db");
+    try {
+      const db = new DatabaseSync(path);
+      db.exec(schema);
+      for (let v = 2; v <= 25; v++) {
+        const file = readdirSync(new URL("../src/store/migrations/", import.meta.url)).find((f) =>
+          f.startsWith(`${String(v).padStart(3, "0")}_`),
+        ) as string;
+        db.exec(readFileSync(new URL(`../src/store/migrations/${file}`, import.meta.url), "utf8"));
+      }
+      db.exec(`
+        PRAGMA user_version = 25;
+        INSERT INTO agents (id, slug, name, harness, created_at, updated_at) VALUES ('a_1', 'alex', 'Alex', 'claude', 0, 0);
+        INSERT INTO agents (id, slug, name, harness, lead_id, created_at, updated_at) VALUES ('a_2', 'coder', 'Coder', 'claude', 'a_1', 0, 0);
+        INSERT INTO connections (id, agent_id, platform, state, created_at, updated_at) VALUES ('n_1', 'a_1', 'team', 'connected', 0, 0);
+        INSERT INTO tasks (id, agent_id, title, status, assignee_id, created_at, updated_at) VALUES ('t1', 'a_1', 'Fix "login"', 'todo', 'a_2', 0, 0);
+        INSERT INTO tasks (id, agent_id, title, status, assignee_id, created_at, updated_at) VALUES ('t2', 'a_1', 'Old', 'done', 'a_2', 0, 0);
+      `);
+      db.close();
+
+      const store = new Store(path);
+      try {
+        expect(store.agent("a_2")?.slug).toBe("coder");
+        const lead = store.db.prepare("SELECT lead_id FROM agents WHERE id = 'a_2'").get() as Record<string, unknown>;
+        expect(lead.lead_id).toBeNull();
+        expect(store.db.prepare("SELECT count(*) AS n FROM connections").get()).toMatchObject({ n: 0 });
+        const notes = store.ownerNotes("a_1").map((n) => n.body);
+        expect(notes).toHaveLength(1);
+        expect(notes[0]).toContain("t1");
+        expect(store.task("a_1", "t1")).toMatchObject({ status: "todo", lineState: null });
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

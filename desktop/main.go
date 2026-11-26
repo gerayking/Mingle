@@ -29,6 +29,7 @@ func main() {
 	}
 	// The web console and native controls share the system's supported language.
 	mygo.App.SetLanguages("en", "zh-CN")
+	clearWebCachesAfterUpdate()
 	logs, _ := mygo.App.Path(mygo.PathLogs)
 	resources, _ := mygo.App.Path(mygo.PathResources)
 	d := newDaemon(resources, logs)
@@ -54,7 +55,7 @@ func main() {
 		mygo.App.Focus()
 	}
 	tray := newTrayController(t, logs, updates, show)
-	mygo.Bind(updates, newOnline(tray), &Appearance{})
+	mygo.Bind(updates, newOnline(tray), &Appearance{}, &Shell{tray: tray})
 	mygo.App.OnSecondInstance(func([]string, string) { show() })
 	mygo.App.OnActivate(func(bool) { show() })
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { quitting = true })
@@ -130,12 +131,34 @@ func setAppMenu(tray *trayController) {
 			{Role: mygo.RoleAbout},
 			updater.MenuItem(),
 			mygo.Separator(),
+			{Label: tray.t.settings, Accelerator: "Cmd+,", Click: tray.pageClick("/settings")},
+			mygo.Separator(),
+			{Role: mygo.RoleServices},
+			mygo.Separator(),
 			{Role: mygo.RoleHide},
+			{Role: mygo.RoleHideOthers},
+			{Role: mygo.RoleUnhide},
 			mygo.Separator(),
 			// Asks first while agents are online, as the menu bar's Quit does.
 			{Label: tray.t.quit, Accelerator: "CmdOrCtrl+Q", Click: func(*mygo.MenuItem, *mygo.Window) { go tray.quit() }},
 		}},
+		// The console leaves these keys to the menu in the Mac app (web/src/shortcuts.ts).
+		{Role: mygo.RoleFileMenu, Submenu: []*mygo.MenuItem{
+			{Label: tray.t.newAgent, Accelerator: "Cmd+N", Click: tray.pageClick("/new")},
+			mygo.Separator(),
+			// Hides the window: Mingle keeps running in the menu bar.
+			{Role: mygo.RoleClose},
+		}},
 		{Role: mygo.RoleEditMenu},
+		{Role: mygo.RoleViewMenu, Submenu: []*mygo.MenuItem{
+			{Role: mygo.RoleReload},
+			mygo.Separator(),
+			{Role: mygo.RoleResetZoom},
+			{Role: mygo.RoleZoomIn},
+			{Role: mygo.RoleZoomOut},
+			mygo.Separator(),
+			{Role: mygo.RoleToggleFullScreen},
+		}},
 		{Role: mygo.RoleWindowMenu},
 	}))
 }

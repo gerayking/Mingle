@@ -140,6 +140,20 @@ describe("bots in a chat", () => {
     await until(() => turns.length === 6);
   });
 
+  it("learns whom a message mentions, so the agent can mention them back (MING-107)", async () => {
+    const { mingle, channel, agentId, turns } = await setup();
+    channel.receive({
+      text: "@alex @Bryce小跟班 你们聊几句",
+      mentions: [{ id: "ou_bryce", name: "Bryce小跟班", isBot: true }],
+    });
+    await until(() => turns.length === 1);
+    const connection = mingle.store.connections(agentId).filter((n) => n.platform !== "local")[0];
+    expect(mingle.store.contactByPlatformId(connection?.id as string, "ou_bryce")).toMatchObject({
+      name: "Bryce小跟班",
+      isBot: true,
+    });
+  });
+
   it("recognizes this computer's agents, and never makes a bot the owner", async () => {
     const { mingle, channel, agentId, turns, admin } = await setup();
     // The bot this computer runs on the platform: the platform does not flag it, Mingle knows it.
@@ -150,7 +164,7 @@ describe("bots in a chat", () => {
     });
     await new Promise((r) => setTimeout(r, 300));
     expect(turns).toHaveLength(0);
-    const connection = mingle.store.connections(agentId)[0];
+    const connection = mingle.store.connections(agentId).filter((n) => n.platform !== "local")[0];
     expect(connection?.ownerId).toBeNull();
     expect(mingle.store.contactByPlatformId(connection?.id as string, "bot1")?.isBot).toBe(true);
 

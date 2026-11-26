@@ -1,34 +1,53 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { hash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import QRCode from "qrcode";
-import type { CredentialField, OnboardingMethod, Platform, Trust } from "../channels/channel.ts";
+import type { CredentialField, OnboardingMethod, PermissionId, Platform, Trust } from "../channels/channel.ts";
+import { CHECK_MIN_INTERVAL_MS, checkCommand, checkUntil } from "../core/check.ts";
+import { sendTarget } from "../core/direct.ts";
 import { contactAlias, MingleError, notFound } from "../core/errors.ts";
 import { excerpt, renderMessage } from "../core/format.ts";
 import { readRole } from "../core/home.ts";
 import { renderManual } from "../core/manual.ts";
-import { AVATAR_MAX_BYTES, type Mingle } from "../core/mingle.ts";
+import { AVATAR_MAX_BYTES, type Mingle, mimeOf, type ProxyPatch, UPLOAD_MAX_BYTES } from "../core/mingle.ts";
 import * as people from "../core/people.ts";
 import { nextFire, parseDuration } from "../core/schedule.ts";
 import type { HarnessInfo } from "../harness/harness.ts";
+import { readSshConfig } from "../platform/ssh-config.ts";
 import {
   type Agent,
+  type Chat,
   type Connection,
   type Contact,
   contactName,
   type Handoff,
+  type HearPace,
   type Message,
+  type Task,
   type TaskStatus,
 } from "../store/store.ts";
 import { VERSION } from "../version.ts";
+import { remoteGateway, remoteResponse } from "./remote.ts";
 
-type Env = { Variables: { agent: Agent } };
+/** `line`: the task a line's token is scoped to (docs/spec.md 4.13); absent for the main session. */
+type Env = { Variables: { agent: Agent; line: string | undefined } };
 
 const TASK_STATUSES: readonly TaskStatus[] = ["todo", "in_progress", "done", "closed"];
+
+/** What a line may write (docs/spec.md 4.13): answer about its task, fetch files, report, finish or stop it. */
+const LINE_WRITES: readonly (readonly [string, RegExp])[] = [
+  ["POST", /^\/v1\/agent\/messages\/(reply|send)$/],
+  ["POST", /^\/v1\/agent\/files\/[^/]+\/download$/],
+  ["POST", /^\/v1\/agent\/tasks\/[^/]+\/done$/],
+  ["POST", /^\/v1\/agent\/tasks\/progress$/],
+  // Only to close its own task, when someone says to stop (checked in the route).
+  ["PATCH", /^\/v1\/agent\/tasks\/[^/]+$/],
+];
 
 /**
  * The local API. Two kinds of caller:
@@ -38,6 +57,8 @@ const TASK_STATUSES: readonly TaskStatus[] = ["todo", "in_progress", "done", "cl
 export function createApi(mingle: Mingle): Hono<Env> {
   const app = new Hono<Env>();
   const { store } = mingle;
+  /** The chat apps the owner added: the private chat is built in, not one of them (docs/spec.md 6.9). */
+  const chatApps = (agentId: string) => store.connections(agentId).filter((n) => !mingle.isBuiltin(n));
 
   app.onError((error, c) => {
     if (error instanceof MingleError) {
@@ -52,6 +73,14 @@ export function createApi(mingle: Mingle): Hono<Env> {
   });
 
   app.get("/v1/health", (c) => c.json({ ok: true, version: VERSION }));
+
+  app.get("/v1/ssh-avatars/:host/:file", async (c) => {
+    const file = c.req.param("file");
+    if (!/^[a-zA-Z0-9_-]+\.(png|jpg|jpeg|webp)$/.test(file)) return c.body(null, 404);
+    return remoteResponse(
+      await mingle.remotes.request(c.req.param("host"), { method: "GET", path: `/v1/avatars/${file}` }),
+    );
+  });
 
   /**
    * An agent's picture, for <img> tags that cannot send the admin token. The file name is
@@ -82,31 +111,74 @@ export function createApi(mingle: Mingle): Hono<Env> {
       );
     }
     c.set("agent", agent);
+    c.set("line", mingle.lineForToken(token));
+    // A line speaks for its agent about its task only: it reads freely, and writes only these.
+    if (
+      c.get("line") &&
+      c.req.method !== "GET" &&
+      !LINE_WRITES.some(([method, path]) => method === c.req.method && path.test(new URL(c.req.url).pathname))
+    ) {
+      throw new MingleError(
+        "line_out_of_scope",
+        "this session works on one task: it can reply and send about that task, fetch files, say how far it is with task status, finish it with task done or close it when told to stop, nothing else",
+        403,
+      );
+    }
+    // A command from the agent is progress in its turn, whatever the harness reports.
+    mingle.runtime(agent.id)?.noteProgress();
     await next();
   });
 
   const render = (agent: Agent, m: Message) => renderMessage(store, m, { agentName: agent.name });
 
+  /**
+   * A line replies only about its task: to the message it came from, to what it said itself, or to
+   * follow-ups handed to it. Throws otherwise.
+   */
+  const lineScope = (taskId: string, message?: Message) => {
+    const task = store.taskById(taskId);
+    if (task && message && (message.lineTaskId === task.id || message.id === task.fromMessage)) return;
+    throw new MingleError(
+      "line_out_of_scope",
+      `this session works on ${task?.id ?? taskId} ("${task?.title ?? ""}"): speak only about it, in the chat it came from`,
+      403,
+    );
+  };
+
   app.get("/v1/agent/whoami", (c) => {
     const agent = c.get("agent");
-    const connections = store.connections(agent.id).map((n) => ({
+    const connections = chatApps(agent.id).map((n) => ({
       platform: n.platform,
       bot: n.botName,
       state: mingle.isLive(n.id) ? n.state : n.state === "connected" ? "reconnecting" : n.state,
     }));
-    return c.json({ name: agent.name, harness: agent.harness, home: mingle.homeDir(agent), connections });
+    const line = c.get("line");
+    // What it is doing at once: each line's task and how far it is (docs/spec.md 4.13).
+    const doing = (line ? [store.taskById(line)].filter((t) => t !== undefined) : store.lineTasks(agent.id, 0))
+      .filter((t) => t.status !== "closed" && t.lineState !== "ended")
+      .map((t) => ({ id: t.id, title: t.title, status: t.status, line: t.lineState, from: t.fromMessage }));
+    return c.json({
+      name: agent.name,
+      harness: agent.harness,
+      home: mingle.homeDir(agent),
+      connections,
+      ...(line ? { line } : {}),
+      doing,
+    });
   });
 
   app.get("/v1/agent/manual", (c) => {
     const agent = c.get("agent");
     // The same guide the session opened with, so the variable names match what it can read.
     const names = mingle.options.harness.acceptsEnv?.(agent.harness) === false ? [] : store.envNames(agent.id);
+    const task = c.get("line") ? store.taskById(c.get("line") as string) : undefined;
     return c.text(
       renderManual(
         agent.name,
         readRole(mingle.homeDir(agent)),
         process.platform,
         names.map((v) => v.name),
+        task ? { taskId: task.id, title: task.title, home: mingle.homeDir(agent) } : undefined,
       ),
     );
   });
@@ -127,24 +199,54 @@ export function createApi(mingle: Mingle): Hono<Env> {
     const body = await c.req.json<{ messageId: string; text: string; files?: string[] }>();
     const original = store.agentMessage(agent.id, body.messageId);
     if (!original) throw notFound("message", body.messageId);
+    const line = c.get("line");
+    if (line) lineScope(line, original);
+    // The line's own task, or the one a line works on for this message (docs/spec.md 4.13).
+    const task = line ? store.taskById(line) : store.threadlessLine(agent.id, original.id);
+    // A line answering the message it works for, with a thread open: the result, for the whole chat.
+    const result = Boolean(line && task?.threadChat && original.id === task.fromMessage);
     const report = await mingle.outbox.send(agent.id, {
       chatId: original.chatId,
       text: body.text ?? "",
       replyTo: original.id,
       files: resolveFiles(mingle.homeDir(agent), body.files),
+      lineTaskId: line,
+      // The main session acknowledging work a line took on: the work gets a thread of its own.
+      ...(!line && task ? { inThread: { title: task.title } } : {}),
+      ...(result ? { inChat: true } : {}),
     });
+    // What it answers in the thread is how far it is; the answer to the message itself is the result.
+    if (task) mingle.lineSpoke(task.id, report, { progress: Boolean(line) && original.id !== task.fromMessage });
     return c.json(report);
   });
 
   app.post("/v1/agent/messages/send", async (c) => {
     const agent = c.get("agent");
     refuseIfStopped(agent);
-    const body = await c.req.json<{ chatId: string; text: string; files?: string[] }>();
+    const body = await c.req.json<{ to?: string; chatId?: string; text: string; files?: string[] }>();
+    // A chat, or a person by contact or person ID: their direct chat, opened if need be.
+    const to = body.to ?? body.chatId ?? "";
+    const line = c.get("line");
+    // A line sends only about its task: into its thread, or under the message it came from.
+    const task = line ? store.taskById(line) : undefined;
+    if (line && (!task?.fromChat || (to && to !== task.fromChat && to !== task.threadChat))) lineScope(line);
+    if (!line && !to)
+      throw new MingleError("chat_required", "usage: mingle message send --to <chat-id | contact-id> <<'MSG' ... MSG");
+    // A thread opened under the message: everything but the result goes there (docs/spec.md 4.13).
+    const inOwnThread = Boolean(task?.threadChat && task.threadChat !== task.fromChat);
+    const chatId = task
+      ? ((inOwnThread ? task.threadChat : task.fromChat) as string)
+      : await sendTarget(store, (id) => mingle.liveConnection(id), agent.id, to);
     const report = await mingle.outbox.send(agent.id, {
-      chatId: body.chatId,
+      chatId,
       text: body.text ?? "",
+      ...(task?.fromMessage && !inOwnThread ? { replyTo: task.fromMessage } : {}),
+      // No thread yet: the line's first word about its work opens one, where the chat app can.
+      ...(task && !task.threadChat ? { inThread: { title: task.title } } : {}),
       files: resolveFiles(mingle.homeDir(agent), body.files),
+      lineTaskId: line,
     });
+    if (task) mingle.lineSpoke(task.id, report, { progress: true });
     return c.json(report);
   });
 
@@ -170,10 +272,62 @@ export function createApi(mingle: Mingle): Hono<Env> {
     let members: { id: string; name: string }[] | null = null;
     if (live?.capabilities().listMembers) {
       const ref = { platformId: chat.platformId, kind: chat.kind, ...(chat.name ? { name: chat.name } : {}) };
-      members = (await live.listMembers(ref)).map((m) => ({ id: m.id, name: m.name }));
+      // Each member as a contact, so the agent can name them anywhere a contact ID goes (send --to).
+      members = (await live.listMembers(ref))
+        .filter((m) => m.id && m.id !== live.bot.id)
+        .map((m) => {
+          let contact = store.touchContact(chat.connectionId, m.id, m.name);
+          if (m.isBot && !contact.isBot) contact = store.setContactBot(contact.id, true) ?? contact;
+          return {
+            id: contact.id,
+            name: contactName(contact) ?? m.name,
+            profile: contact.profile,
+            bot: contact.isBot,
+          };
+        });
     }
-    return c.json({ id: chat.id, platform: connection?.platform, kind: chat.kind, name: chat.name, members });
+    // A group that hears everything (or a thread of one): how often it reaches the agent.
+    const group = chat.parentId ? store.chat(chat.parentId) : chat;
+    const hearing = chat.kind !== "dm" && group?.listen ? mingle.hearingView(group) : null;
+    return c.json({ id: chat.id, platform: connection?.platform, kind: chat.kind, name: chat.name, members, hearing });
   });
+
+  /**
+   * The agent sets how often a group that hears everything reaches it (docs/spec.md 4.2):
+   * `{ "every": "1h" }`, `{ "mute": true }` (until someone addresses it there) or `{ "default": true }`.
+   */
+  app.put("/v1/agent/chats/:id/hearing", async (c) => {
+    const body = await c.req.json<{ every?: unknown; mute?: unknown; default?: unknown }>();
+    const given = [body.every !== undefined, body.mute === true, body.default === true].filter(Boolean).length;
+    if (given !== 1)
+      throw new MingleError(
+        "hearing_invalid",
+        'send one of { "every": "1h" }, { "mute": true } or { "default": true }',
+      );
+    if (body.every !== undefined && typeof body.every !== "string")
+      throw new MingleError("hearing_invalid", 'give "every" as a duration, like "1h"');
+    const pace: HearPace =
+      typeof body.every === "string"
+        ? { kind: "every", ms: parseDuration(body.every) }
+        : body.mute === true
+          ? { kind: "muted" }
+          : { kind: "auto" };
+    const { chat, view } = mingle.setHearPace(c.get("agent").id, c.req.param("id"), pace);
+    return c.json({ chat: chat.id, ...view });
+  });
+
+  /**
+   * The agent adds or removes a name a group calls it by (docs/spec.md 4.2): `{ "alias": "小跟班" }`.
+   * A thread stands for its group.
+   */
+  for (const method of ["post", "delete"] as const) {
+    app[method]("/v1/agent/chats/:id/aliases", async (c) => {
+      const { alias } = objectBody(await c.req.json<unknown>());
+      if (typeof alias !== "string") throw new MingleError("alias_invalid", 'send { "alias": "<name>" }');
+      const { chat, aliases } = mingle.alias(c.get("agent").id, c.req.param("id"), alias, method === "post");
+      return c.json({ chat: chat.id, aliases });
+    });
+  }
 
   const contactView = (k: Contact & { platform: Platform; owner: boolean }) => ({
     id: k.id,
@@ -185,9 +339,21 @@ export function createApi(mingle: Mingle): Hono<Env> {
     bot: k.isBot && !k.owner,
     person: k.personId,
     linkedBy: k.linkedBy,
+    profile: k.profile,
   });
 
-  app.get("/v1/agent/contacts", (c) => c.json(store.agentContacts(c.get("agent").id).map(contactView)));
+  app.get("/v1/agent/contacts", (c) => {
+    // `q`: words that must all appear in one of their names (given, platform or person), any case.
+    const words = (c.req.query("q") ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+    const all = store.agentContacts(c.get("agent").id);
+    const found = words.length
+      ? all.filter((k) => {
+          const names = [contactName(k), k.name, k.alias].filter(Boolean).join(" ").toLowerCase();
+          return words.every((w) => names.includes(w));
+        })
+      : all;
+    return c.json(found.map(contactView));
+  });
 
   app.get("/v1/agent/contacts/:id", (c) => c.json(people.info(store, c.get("agent").id, c.req.param("id"))));
 
@@ -296,18 +462,93 @@ export function createApi(mingle: Mingle): Hono<Env> {
 
   app.get("/v1/agent/tasks", (c) => {
     const agent = c.get("agent");
+    const line = c.get("line");
+    // A line sees the task it works on.
+    if (line) return c.json([store.taskById(line)].filter(Boolean));
     return c.json(store.tasks(agent.id, c.req.query("all") === "1"));
+  });
+
+  /** Start a line for work that takes a while (docs/spec.md 4.13): the brief comes on standard input. */
+  app.post("/v1/agent/tasks/run", async (c) => {
+    const agent = c.get("agent");
+    refuseIfStopped(agent);
+    const body = await c.req.json<{ title?: string; from?: string; brief?: string }>();
+    if (!body.title?.trim())
+      throw new MingleError(
+        "title_required",
+        'give the task a title: mingle task run "Fix the login" --from <message-id>',
+      );
+    if (!body.from)
+      throw new MingleError("from_required", "pass --from <message-id>: the message the work is for, where it answers");
+    if (!body.brief?.trim())
+      throw new MingleError("brief_required", "pass the brief on standard input: what to do, and what done looks like");
+    const task = mingle.runTask(agent.id, { title: body.title.trim(), from: body.from, brief: body.brief.trim() });
+    // Whether the acknowledgement opens a thread for the work, so the main session can say where to follow it.
+    return c.json({ ...task, thread: task.threadChat ? "existing" : mingle.canOpenThread(task) ? "opens" : "none" });
+  });
+
+  /** Pass a message, a note, or both on to a line. */
+  app.post("/v1/agent/tasks/:id/tell", async (c) => {
+    const agent = c.get("agent");
+    const body = await c.req.json<{ text?: string; from?: string }>();
+    return c.json(
+      mingle.tellTask(agent.id, c.req.param("id"), {
+        ...(body.text ? { text: body.text } : {}),
+        ...(body.from ? { from: body.from } : {}),
+      }),
+    );
+  });
+
+  /** A line finishes its task with a summary for the main session. */
+  app.post("/v1/agent/tasks/:id/done", async (c) => {
+    const agent = c.get("agent");
+    const line = c.get("line");
+    if (line !== c.req.param("id")) {
+      throw new MingleError(
+        "line_only",
+        line
+          ? `this session works on ${line}; finish that one`
+          : "task done is how a line finishes its task; for your own, use task update <id> --status done",
+        403,
+      );
+    }
+    const { summary } = await c.req.json<{ summary?: string }>();
+    return c.json(mingle.doneTask(agent.id, line, summary ?? ""));
+  });
+
+  /** A line says how far it is, for the console, where it has no thread to say it in (docs/spec.md 4.13). */
+  app.post("/v1/agent/tasks/progress", async (c) => {
+    const agent = c.get("agent");
+    const line = c.get("line");
+    if (!line) {
+      throw new MingleError(
+        "line_only",
+        "task status is how a line says how far it is; tell people in the chat instead",
+        403,
+      );
+    }
+    const { text } = await c.req.json<{ text?: string }>();
+    if (!text?.trim())
+      throw new MingleError("text_required", 'say how far you are: mingle task status "Found the cause"');
+    return c.json(mingle.taskProgress(agent.id, line, text));
   });
 
   app.patch("/v1/agent/tasks/:id", async (c) => {
     const agent = c.get("agent");
     const { status } = await c.req.json<{ status: TaskStatus }>();
+    const line = c.get("line");
+    // A line may close its own task when someone tells it to stop; nothing else.
+    if (line && (line !== c.req.param("id") || status !== "closed")) {
+      throw new MingleError(
+        "line_out_of_scope",
+        `this session can only close its own task when told to stop: task update ${line} --status closed`,
+        403,
+      );
+    }
     if (!TASK_STATUSES.includes(status)) {
       throw new MingleError("invalid_status", `use one of: ${TASK_STATUSES.join(", ")}`);
     }
-    const task = store.setTaskStatus(agent.id, c.req.param("id"), status);
-    if (!task) throw notFound("task", c.req.param("id"));
-    return c.json(task);
+    return c.json(mingle.setTaskStatus(agent.id, c.req.param("id"), status, Boolean(line)));
   });
 
   app.post("/v1/agent/reminders", async (c) => {
@@ -319,6 +560,9 @@ export function createApi(mingle: Mingle): Hono<Env> {
       every?: string;
       chat?: string;
       from?: string;
+      check?: string;
+      once?: boolean;
+      for?: string;
     }>();
     if (!body.text?.trim())
       throw new MingleError(
@@ -339,6 +583,12 @@ export function createApi(mingle: Mingle): Hono<Env> {
       }
       chatId = source.chatId;
     }
+    if (body.for !== undefined && body.check === undefined)
+      throw new MingleError("check_required", "--for goes with --check: it says how long to keep checking");
+    if (body.once && body.check === undefined)
+      throw new MingleError("check_required", "--once goes with --check: it ends the reminder after the first change");
+    if (body.check !== undefined && !body.every)
+      throw new MingleError("check_needs_every", "a check runs on a schedule: pass --every 5m with --check");
     const now = Date.now();
     let rule = "once";
     let next: number;
@@ -355,7 +605,26 @@ export function createApi(mingle: Mingle): Hono<Env> {
     } else {
       throw new MingleError("when_required", "pass one of --in 30m, --at <time> or --every daily@09:00");
     }
+    // A check runs once now: a broken command fails here, and the agent sees where things stand.
+    let check: { command: string; once: boolean; hash: string; until: number | null } | null = null;
+    // The first run's output goes back in this response only; only its hash is kept.
+    let checkOutput: string | null = null;
+    if (body.check !== undefined) {
+      const command = checkCommand(body.check);
+      if (rule.startsWith("every:") && nextFire(rule, now) - now < CHECK_MIN_INTERVAL_MS)
+        throw new MingleError("check_too_often", "check at most once a minute: --every 1m or longer");
+      const until = checkUntil(body.for, now);
+      const result = await mingle.probeCheck(agent.id, command);
+      if (!result.ok)
+        throw new MingleError(
+          "check_failed",
+          `the check ${result.error}. Fix the command and set the reminder again; it must exit 0`,
+        );
+      check = { command, once: body.once === true, hash: result.hash, until };
+      checkOutput = result.output;
+    }
     const reminder = store.createReminder({
+      check,
       agentId: agent.id,
       body: body.text.trim(),
       rule,
@@ -364,7 +633,7 @@ export function createApi(mingle: Mingle): Hono<Env> {
       sourceMessageId: body.from ?? null,
       nextFireAt: next,
     });
-    return c.json(reminder);
+    return c.json(check ? { ...reminder, checkOutput } : reminder);
   });
 
   // "Not yet, look again in 2h": the next fire moves to `by` from now; a recurring reminder then keeps its rule.
@@ -381,7 +650,9 @@ export function createApi(mingle: Mingle): Hono<Env> {
   app.get("/v1/agent/reminders", (c) => c.json(store.reminders(c.get("agent").id)));
 
   app.delete("/v1/agent/reminders/:id", (c) => {
-    if (!store.deleteReminder(c.get("agent").id, c.req.param("id"))) throw notFound("reminder", c.req.param("id"));
+    const agent = c.get("agent");
+    if (!store.deleteReminder(agent.id, c.req.param("id"))) throw notFound("reminder", c.req.param("id"));
+    mingle.abortCheck(agent.id, c.req.param("id"));
     return c.json({ ok: true });
   });
 
@@ -392,10 +663,56 @@ export function createApi(mingle: Mingle): Hono<Env> {
     if (token !== mingle.adminToken)
       throw new MingleError("unauthorized", "admin token mismatch; is this the running Mingle?", 401);
     await next();
+    // Conditional GET for console polling: unchanged JSON answers 304 so the UI skips parsing and re-renders.
+    if (c.req.method !== "GET" || c.res.status !== 200) return;
+    if (!c.res.headers.get("content-type")?.includes("application/json")) return;
+    const body = Buffer.from(await c.res.arrayBuffer());
+    const etag = `W/"${body.byteLength.toString(36)}-${hash("sha1", body, "base64url")}"`;
+    const headers = new Headers(c.res.headers);
+    headers.set("etag", etag);
+    headers.set("cache-control", "no-cache");
+    const inm = c.req.header("if-none-match");
+    if (inm === etag || (inm?.includes(",") && inm.split(",").some((part) => part.trim() === etag))) {
+      headers.delete("content-type");
+      headers.delete("content-length");
+      c.res = new Response(null, { status: 304, headers });
+      return;
+    }
+    c.res = new Response(body, { status: 200, headers });
   });
 
+  app.use("/v1/admin/*", remoteGateway(mingle.remotes));
+  app.get("/v1/admin/ssh/config", async (c) => c.json(await readSshConfig()));
+  app.get("/v1/admin/ssh/hosts", (c) => c.json(mingle.remotes.list()));
+  app.post("/v1/admin/ssh/hosts", async (c) => c.json(await mingle.remotes.add(await c.req.json()), 201));
+  app.post("/v1/admin/ssh/installations", async (c) => c.json(mingle.remotes.install(await c.req.json()), 202));
+  app.get("/v1/admin/ssh/installations/:id", (c) => c.json(mingle.remotes.installation(c.req.param("id"))));
+
+  /**
+   * The private chat (docs/spec.md 6.9): what the agent said there that the owner has not seen. While
+   * the console shows the chat, what arrives counts as seen at once, so the desktop app does not
+   * notify about what the owner is already reading.
+   */
+  const watching = new Map<string, number>();
+  const chatView = (agent: Agent) => {
+    const chat = mingle.localChatOf(agent.id);
+    if (!chat) return { unread: 0, last: null };
+    const since = (watching.get(agent.id) ?? 0) > Date.now() ? Date.now() : agent.chatSeenAt;
+    const { count, last } = store.saidSince(chat.id, since);
+    return {
+      unread: count,
+      last: last
+        ? {
+            id: last.id,
+            preview: [...last.body.replace(/\s+/g, " ").trim()].slice(0, 120).join(""),
+            at: last.createdAt,
+          }
+        : null,
+    };
+  };
+
   const agentView = (agent: Agent) => {
-    const connections = store.connections(agent.id);
+    const connections = chatApps(agent.id);
     const shared = sharedOwners(connections);
     return {
       ...agent,
@@ -418,6 +735,9 @@ export function createApi(mingle: Mingle): Hono<Env> {
         claim: claimView(n),
       })),
       requests: accessRequests(agent.id),
+      // Things under way at once, besides talking (docs/spec.md 4.13).
+      doing: mingle.lines.busy(agent.id),
+      chat: chatView(agent),
     };
   };
 
@@ -529,7 +849,14 @@ export function createApi(mingle: Mingle): Hono<Env> {
     }
   };
 
-  app.get("/v1/admin/status", (c) => c.json({ version: VERSION, agents: store.agents().map(agentView) }));
+  app.get("/v1/admin/status", async (c) => {
+    const local = store.agents().map(agentView);
+    const remote = c.req.query("local") === "1" ? [] : await mingle.remotes.agents();
+    return c.json({
+      version: VERSION,
+      agents: store.orderByAgentOrder([...local, ...remote]),
+    });
+  });
 
   /**
    * Every agent in a line, for the desktop app's menu bar icon (docs/spec.md 9.1): its state, what it
@@ -538,8 +865,8 @@ export function createApi(mingle: Mingle): Hono<Env> {
   app.get("/v1/admin/summary", (c) =>
     c.json({
       version: VERSION,
-      agents: store.agents().map((agent) => {
-        const connections = store.connections(agent.id);
+      agents: store.orderByAgentOrder(store.agents()).map((agent) => {
+        const connections = chatApps(agent.id);
         const given = store.retryable(agent.id);
         return {
           id: agent.id,
@@ -557,6 +884,8 @@ export function createApi(mingle: Mingle): Hono<Env> {
           })),
           failed: given.filter((m) => m.state === "failed").length,
           unanswered: given.filter((m) => m.state === "unanswered").length,
+          // What it said in the private chat that the owner has not seen (docs/spec.md 6.9).
+          chat: chatView(agent),
         };
       }),
     }),
@@ -655,41 +984,103 @@ export function createApi(mingle: Mingle): Hono<Env> {
     return c.json(await setup.check());
   });
 
-  app.get("/v1/admin/agents/:id/activity", (c) => {
-    const agent = mingle.agent(c.req.param("id"));
-    const limit = clamp(Number(c.req.query("limit") ?? 30), 1, 200);
+  /** One message as the console shows it in the activity: who said it, where, and what became of it. */
+  const activityView = (agent: Agent) => {
     const connections = store.connections(agent.id);
     const owners = new Set(connections.map((n) => `${n.id}:${n.ownerId}`));
     const shared = sharedOwners(connections);
+    // The work a message started, or the line it went to (docs/spec.md 4.13).
+    const lines = store.lineTasks(agent.id, 0);
+    const lineById = new Map<string, Task>();
+    const lineByMessage = new Map<string, Task>();
+    for (const task of lines) {
+      lineById.set(task.id, task);
+      if (task.fromMessage && !lineByMessage.has(task.fromMessage)) lineByMessage.set(task.fromMessage, task);
+    }
+    const contacts = new Map<string, Contact | undefined>();
+    const contactOf = (connectionId: string, senderId: string) => {
+      const key = `${connectionId}\0${senderId}`;
+      if (contacts.has(key)) return contacts.get(key);
+      const found = store.contactByPlatformId(connectionId, senderId);
+      contacts.set(key, found);
+      return found;
+    };
+    const lineOf = (m: Message) => {
+      const task = m.lineTaskId ? lineById.get(m.lineTaskId) : lineByMessage.get(m.id);
+      return task
+        ? { id: task.id, title: task.title, state: lineState(task), started: task.fromMessage === m.id }
+        : null;
+    };
+    return (m: Message & { chat: Chat; platform: Platform }) => {
+      const contact = m.direction === "in" && m.senderId ? contactOf(m.chat.connectionId, m.senderId) : undefined;
+      const senderIsOwner = m.direction === "in" && owners.has(`${m.chat.connectionId}:${m.senderId}`);
+      return {
+        id: m.id,
+        direction: m.direction,
+        triggers: m.triggers,
+        platform: m.platform,
+        chat: { id: m.chat.id, kind: m.chat.kind, name: m.chat.name },
+        // A platform ID is not a name: send null and let the console label the person.
+        sender:
+          m.direction === "out"
+            ? agent.name
+            : (contactName(contact) ?? (m.senderName && m.senderName !== m.senderId ? m.senderName : null)),
+        senderIsOwner,
+        /** The console may call an unnamed owner "you" only when that cannot mean two people. */
+        senderIsOnlyOwner: senderIsOwner && !shared.has(m.chat.connectionId),
+        senderIsBot: !senderIsOwner && Boolean(contact?.isBot),
+        contactId: contact?.id ?? null,
+        body: m.body,
+        state: m.state,
+        /** While waiting for a passing failure: when Mingle tries it again. */
+        retryAt: m.state === "waiting" ? (m.retryAt ?? null) : null,
+        files: m.attachments.map((a) => a.name),
+        createdAt: m.createdAt,
+        line: lineOf(m),
+      };
+    };
+  };
+
+  app.get("/v1/admin/agents/:id/activity", (c) => {
+    const agent = mingle.agent(c.req.param("id"));
+    const limit = clamp(Number(c.req.query("limit") ?? 30), 1, 200);
+    return c.json(store.agentActivity(agent.id, limit).map(activityView(agent)));
+  });
+
+  /**
+   * The activity by conversation (DESIGN.md "Agent · 动态"): the chats that spoke last, each with its
+   * latest messages and whatever still needs the owner. `chat` and `before` page one chat further back.
+   */
+  app.get("/v1/admin/agents/:id/conversations", (c) => {
+    const agent = mingle.agent(c.req.param("id"));
+    const chatId = c.req.query("chat");
+    if (chatId && !store.agentChat(agent.id, chatId)) throw notFound("chat", chatId);
+    const before = c.req.query("before");
+    const view = activityView(agent);
+    const conversations = store.agentConversations(agent.id, {
+      chats: clamp(Number(c.req.query("limit") ?? 20), 1, 100),
+      messages: clamp(Number(c.req.query("messages") ?? 6), 1, 50),
+      ...(chatId ? { chatId } : {}),
+      ...(before ? { before: Number(before) } : {}),
+    });
     return c.json(
-      store.agentActivity(agent.id, limit).map((m) => {
-        const contact =
-          m.direction === "in" && m.senderId ? store.contactByPlatformId(m.chat.connectionId, m.senderId) : undefined;
-        const senderIsOwner = m.direction === "in" && owners.has(`${m.chat.connectionId}:${m.senderId}`);
-        return {
-          id: m.id,
-          direction: m.direction,
-          triggers: m.triggers,
-          platform: m.platform,
-          chat: { id: m.chat.id, kind: m.chat.kind, name: m.chat.name },
-          // A platform ID is not a name: send null and let the console label the person.
-          sender:
-            m.direction === "out"
-              ? agent.name
-              : (contactName(contact) ?? (m.senderName && m.senderName !== m.senderId ? m.senderName : null)),
-          senderIsOwner,
-          /** The console may call an unnamed owner "you" only when that cannot mean two people. */
-          senderIsOnlyOwner: senderIsOwner && !shared.has(m.chat.connectionId),
-          senderIsBot: !senderIsOwner && Boolean(contact?.isBot),
-          contactId: contact?.id ?? null,
-          body: m.body,
-          state: m.state,
-          /** While waiting for a passing failure: when Mingle tries it again. */
-          retryAt: m.state === "waiting" ? (m.retryAt ?? null) : null,
-          files: m.attachments.map((a) => a.name),
-          createdAt: m.createdAt,
-        };
-      }),
+      conversations.map((v) => ({
+        chat: { id: v.chat.id, kind: v.chat.kind, name: v.chat.name },
+        parent: v.parent ? { id: v.parent.id, kind: v.parent.kind, name: v.parent.name } : null,
+        platform: v.platform,
+        // A group: whether it hears everything (docs/spec.md 4.2). Null where that cannot be set:
+        // not a group, or a chat app that only sends the bot what @s it.
+        listen:
+          v.chat.kind === "group" && mingle.hasChannel(v.platform) && mingle.channel(v.platform).groupMessages
+            ? v.chat.listen
+            : null,
+        // A group that hears everything: the pace the agent set, or the slowing in force.
+        hearing: v.chat.kind === "group" && v.chat.listen ? mingle.hearingView(v.chat) : null,
+        latestAt: v.latestAt,
+        earlier: v.earlier,
+        cursor: v.cursor,
+        messages: v.messages.map((m) => view({ ...m, chat: v.chat, platform: v.platform })),
+      })),
     );
   });
 
@@ -729,7 +1120,12 @@ export function createApi(mingle: Mingle): Hono<Env> {
   app.get("/v1/admin/agents/:id/contacts", (c) => {
     const agent = mingle.agent(c.req.param("id"));
     const shared = sharedOwners(store.connections(agent.id));
-    const all = store.agentContacts(agent.id);
+    // Who talked to the agent, or whom someone already decided something about. Group members it
+    // only knows from the member list stay in its address book, not on the owner's page.
+    const wrote = store.contactsWhoWrote(agent.id);
+    const all = store
+      .agentContacts(agent.id)
+      .filter((k) => wrote.has(k.id) || k.owner || k.personId || k.alias || k.access !== null);
     const account = (k: (typeof all)[number]) => ({
       id: k.id,
       platform: k.platform,
@@ -742,8 +1138,19 @@ export function createApi(mingle: Mingle): Hono<Env> {
       ownerShared: k.owner && shared.has(k.connectionId),
       bot: k.isBot && !k.owner,
       linkedBy: k.linkedBy,
+      profile: k.profile,
     });
     const byPerson = new Map(store.agentPeople(agent.id).map((p) => [p.id, p]));
+    const membersByPerson = new Map<string, (typeof all)[number][]>();
+    for (const k of all) {
+      if (!k.personId) continue;
+      let group = membersByPerson.get(k.personId);
+      if (!group) {
+        group = [];
+        membersByPerson.set(k.personId, group);
+      }
+      group.push(k);
+    }
     const seen = new Set<string>();
     const entries: unknown[] = [];
     for (const k of all) {
@@ -754,7 +1161,7 @@ export function createApi(mingle: Mingle): Hono<Env> {
       if (seen.has(k.personId)) continue;
       seen.add(k.personId);
       const person = byPerson.get(k.personId);
-      const members = all.filter((m) => m.personId === k.personId);
+      const members = membersByPerson.get(k.personId) ?? [];
       entries.push({
         person: k.personId,
         name: person?.name ?? null,
@@ -810,6 +1217,46 @@ export function createApi(mingle: Mingle): Hono<Env> {
     return c.json({ settled });
   });
 
+  /**
+   * The owner sets a group to hear everything, or only what is addressed to the agent (docs/spec.md
+   * 4.2): `{ "listen": true }` or `{ "listen": false }`.
+   */
+  app.put("/v1/admin/agents/:id/chats/:chatId/listen", async (c) => {
+    const { listen } = await c.req.json<{ listen?: unknown }>();
+    if (typeof listen !== "boolean")
+      throw new MingleError("listen_invalid", 'send { "listen": true } or { "listen": false }');
+    mingle.setListen(c.req.param("id"), c.req.param("chatId"), listen);
+    return c.json({ listen });
+  });
+
+  /**
+   * The owner picks how fast a group keeps up with a conversation (docs/spec.md 4.2):
+   * `{ "tier": "save" | "balanced" | "fast" | null }`, null following the group's size.
+   */
+  app.put("/v1/admin/agents/:id/chats/:chatId/hearing", async (c) => {
+    const { tier } = objectBody(await c.req.json<unknown>());
+    if (tier !== null && tier !== "save" && tier !== "balanced" && tier !== "fast")
+      throw new MingleError("tier_invalid", 'send { "tier": "save" }, "balanced", "fast" or null');
+    return c.json(mingle.setHearTier(c.req.param("id"), c.req.param("chatId"), tier));
+  });
+
+  /**
+   * The owner adds or removes one name a group calls the agent by: `{ "alias": "小跟班" }`. One at a
+   * time, applied to the list as it is now, so a name the agent added meanwhile is kept.
+   */
+  for (const method of ["post", "delete"] as const) {
+    app[method]("/v1/admin/agents/:id/chats/:chatId/aliases", async (c) => {
+      const { alias } = objectBody(await c.req.json<unknown>());
+      if (typeof alias !== "string") throw new MingleError("alias_invalid", 'send { "alias": "<name>" }');
+      return c.json(mingle.ownerAlias(c.req.param("id"), c.req.param("chatId"), alias, method === "post"));
+    });
+  }
+
+  /** The owner puts a group back on Mingle's own pace, whatever the agent set (docs/spec.md 4.2). */
+  app.delete("/v1/admin/agents/:id/chats/:chatId/hearing", (c) =>
+    c.json(mingle.resetHearPace(c.req.param("id"), c.req.param("chatId"))),
+  );
+
   /** The people and groups the owner (or the default) let in or turned away, to change their mind. */
   app.get("/v1/admin/agents/:id/access", (c) => {
     const agent = mingle.agent(c.req.param("id"));
@@ -843,9 +1290,54 @@ export function createApi(mingle: Mingle): Hono<Env> {
     return c.json(agentView(mingle.agent(c.req.param("id"))));
   });
 
+  /** The daily memory tidy-up (docs/spec.md 4.5), on by default. */
+  app.put("/v1/admin/agents/:id/tidy", async (c) => {
+    const { on } = await c.req.json<{ on?: unknown }>();
+    mingle.setTidy(c.req.param("id"), on === true);
+    return c.json(agentView(mingle.agent(c.req.param("id"))));
+  });
+
   app.get("/v1/admin/agents/:id/work", (c) => {
     const agent = mingle.agent(c.req.param("id"));
-    return c.json({ tasks: store.tasks(agent.id, false), reminders: store.reminders(agent.id) });
+    // Open tasks, and the work its lines finished in the last day.
+    const lines = store.lineTasks(agent.id, Date.now() - 86_400_000);
+    const lineIds = new Set(lines.map((l) => l.id));
+    const open = store.tasks(agent.id, false).filter((t) => !lineIds.has(t.id));
+    const chats = new Map<string, Chat | undefined>();
+    const connections = new Map<string, Connection | undefined>();
+    const chatOf = (id: string) => {
+      if (chats.has(id)) return chats.get(id);
+      const found = store.chat(id);
+      chats.set(id, found);
+      return found;
+    };
+    const connectionOf = (id: string) => {
+      if (connections.has(id)) return connections.get(id);
+      const found = store.connection(id);
+      connections.set(id, found);
+      return found;
+    };
+    const tasks = [...open, ...lines]
+      .filter((t) => t.status !== "closed")
+      // Work under way first, oldest first; what finished today after it.
+      .sort((a, b) => Number(a.status === "done") - Number(b.status === "done") || a.createdAt - b.createdAt)
+      .map((t) => {
+        const chat = t.fromChat ? chatOf(t.fromChat) : undefined;
+        const platform = chat ? connectionOf(chat.connectionId)?.platform : undefined;
+        return {
+          id: t.id,
+          title: t.title,
+          status: t.status,
+          line: t.lineState ? lineState(t) : null,
+          summary: t.summary,
+          progress: t.progress,
+          error: t.lineError,
+          createdAt: t.createdAt,
+          updatedAt: t.updatedAt,
+          from: chat ? { name: chat.name, platform } : null,
+        };
+      });
+    return c.json({ tasks, reminders: store.reminders(agent.id) });
   });
 
   /** The owner stops a reminder; the agent hears it with its next input (docs/spec.md 4.6). */
@@ -874,6 +1366,129 @@ export function createApi(mingle: Mingle): Hono<Env> {
 
   app.get("/v1/admin/agents/:id/handoff-prompt", (c) => c.json({ text: mingle.handoffPrompt(c.req.param("id")) }));
 
+  // ------------------------------------------------------------ private chat (docs/spec.md 6.9)
+
+  /** One message of the private chat as the console shows it. Mingle's own notices are left out. */
+  const chatMessageView = (agent: Agent) => {
+    const lines = store.lineTasks(agent.id, 0);
+    const lineById = new Map<string, Task>();
+    const lineByMessage = new Map<string, Task>();
+    for (const task of lines) {
+      lineById.set(task.id, task);
+      if (task.fromMessage && !lineByMessage.has(task.fromMessage)) lineByMessage.set(task.fromMessage, task);
+    }
+    return (m: Message) => {
+      const task = m.lineTaskId ? lineById.get(m.lineTaskId) : lineByMessage.get(m.id);
+      return {
+        id: m.id,
+        direction: m.direction,
+        body: m.body,
+        state: m.state,
+        retryAt: m.state === "waiting" ? (m.retryAt ?? null) : null,
+        createdAt: m.createdAt,
+        files: m.attachments.map((a) => ({
+          id: a.id,
+          name: a.name,
+          size: a.size ?? null,
+          mime: a.mime ?? mimeOf(a.name) ?? null,
+        })),
+        line: task
+          ? { id: task.id, title: task.title, state: lineState(task), started: task.fromMessage === m.id }
+          : null,
+      };
+    };
+  };
+
+  /**
+   * The private chat, newest last: `limit` messages before `before`, or the latest. With `watching`,
+   * the console is showing it: what is there now, and what arrives in the next few seconds, is seen.
+   */
+  app.get("/v1/admin/agents/:id/chat", (c) => {
+    const agent = mingle.agent(c.req.param("id"));
+    const limit = clamp(Number(c.req.query("limit") ?? 50), 1, 200);
+    const before = c.req.query("before");
+    if (c.req.query("watching") === "1") {
+      watching.set(agent.id, Date.now() + CHAT_WATCH_MS);
+      store.setChatSeen(agent.id, Date.now());
+    }
+    const chat = mingle.localChatOf(agent.id);
+    if (!chat) return c.json({ messages: [], more: false });
+    // One more than asked, to tell whether there is anything earlier.
+    const page = store.chatMessages(chat.id, limit + 1, before || undefined, { excludeNotices: true });
+    const more = page.length > limit;
+    return c.json({ messages: (more ? page.slice(-limit) : page).map(chatMessageView(agent)), more });
+  });
+
+  app.post("/v1/admin/agents/:id/chat", async (c) => {
+    const agent = mingle.agent(c.req.param("id"));
+    const body = await c.req.json<{ text?: unknown; files?: unknown }>();
+    const ids = Array.isArray(body.files) ? body.files.filter((f): f is string => typeof f === "string") : [];
+    const files = ids.map((id) => {
+      const file = mingle.upload(agent.id, id);
+      if (!file) throw new MingleError("file_not_found", "attach the file again", 404);
+      return file;
+    });
+    const message = mingle.sayLocally(agent.id, { text: typeof body.text === "string" ? body.text : "", files });
+    // The owner is looking at the chat they just wrote in.
+    watching.set(agent.id, Date.now() + CHAT_WATCH_MS);
+    store.setChatSeen(agent.id, Date.now());
+    return c.json(chatMessageView(agent)(message), 201);
+  });
+
+  /** A file the owner is about to send: the body is its bytes, `x-file-name` its name (URI-encoded). */
+  app.post("/v1/admin/agents/:id/chat/uploads", async (c) => {
+    const agent = mingle.agent(c.req.param("id"));
+    if (Number(c.req.header("content-length") ?? 0) > UPLOAD_MAX_BYTES)
+      throw new MingleError("file_too_large", "send files under 100 MB", 413);
+    let name = c.req.header("x-file-name") ?? "";
+    try {
+      name = decodeURIComponent(name);
+    } catch {}
+    const type = c.req.header("content-type")?.split(";")[0]?.trim();
+    const upload = mingle.saveUpload(agent.id, {
+      name,
+      bytes: new Uint8Array(await c.req.arrayBuffer()),
+      ...(type && type !== "application/octet-stream" ? { mime: type } : {}),
+    });
+    return c.json(upload, 201);
+  });
+
+  /** A file in the private chat, sent or received: its bytes, for a preview or to save. */
+  const chatFile = (agentId: string, fileId: string) => {
+    const chat = mingle.localChatOf(agentId);
+    const found = chat && store.chatFile(chat.id, fileId);
+    if (!found) throw notFound("file", fileId);
+    try {
+      if (!statSync(found.attachment.ref).isFile()) throw notFound("file", fileId);
+    } catch (error) {
+      if (error instanceof MingleError) throw error;
+      throw notFound("file", fileId);
+    }
+    return found.attachment;
+  };
+
+  app.get("/v1/admin/agents/:id/chat/files/:fileId", (c) => {
+    const agent = mingle.agent(c.req.param("id"));
+    const file = chatFile(agent.id, c.req.param("fileId"));
+    return c.body(readFileSync(file.ref), 200, {
+      "content-type": file.mime ?? mimeOf(file.name) ?? "application/octet-stream",
+      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+      "cache-control": "private, max-age=31536000, immutable",
+      "cross-origin-resource-policy": "same-origin",
+      "x-content-type-options": "nosniff",
+    });
+  });
+
+  /** Show the file in Finder (Explorer, or its folder elsewhere). */
+  app.post("/v1/admin/agents/:id/chat/files/:fileId/reveal", (c) => {
+    const agent = mingle.agent(c.req.param("id"));
+    const file = chatFile(agent.id, c.req.param("fileId"));
+    if (process.platform === "darwin") execFile("open", ["-R", file.ref], () => {});
+    else if (process.platform === "win32") execFile("explorer", [`/select,${file.ref}`], () => {});
+    else execFile("xdg-open", [dirname(file.ref)], () => {});
+    return c.json({ ok: true });
+  });
+
   app.post("/v1/admin/agents/:id/open-home", (c) => {
     const agent = mingle.agent(c.req.param("id"));
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "explorer" : "xdg-open";
@@ -890,6 +1505,18 @@ export function createApi(mingle: Mingle): Hono<Env> {
     if (!found) throw new MingleError("harness_unavailable", `${id} is not installed here`);
     if (found.disabled) throw new MingleError(found.disabled.code, found.disabled.reason);
   };
+
+  app.put("/v1/admin/agents/order", async (c) => {
+    const body = await c.req.json<{ ids?: unknown }>().catch(() => null);
+    if (
+      !body ||
+      !Array.isArray(body.ids) ||
+      !body.ids.every((id): id is string => typeof id === "string" && id.trim().length > 0)
+    ) {
+      throw new MingleError("invalid_order", "Pass an array of agent IDs.", 400);
+    }
+    return c.json({ ids: store.setAgentOrder(body.ids) });
+  });
 
   app.post("/v1/admin/agents", async (c) => {
     const body = await c.req.json<{ name: string; role?: string; harness: string; model?: string }>();
@@ -1009,8 +1636,19 @@ export function createApi(mingle: Mingle): Hono<Env> {
 
   /** QR onboarding: start, then poll. The QR is rendered here so the console needs no encoder. */
   app.post("/v1/admin/agents/:id/onboarding", async (c) => {
-    const { platform, connectionId } = await c.req.json<{ platform: Platform; connectionId?: string }>();
-    const session = mingle.startOnboarding(c.req.param("id"), platform, connectionId || undefined);
+    const { platform, connectionId, adding } = await c.req.json<{
+      platform: Platform;
+      connectionId?: string;
+      /** Optional permissions to turn on while re-authorizing that bot. */
+      adding?: PermissionId[];
+    }>();
+    const known: readonly PermissionId[] = ["group_messages", "bot_messages", "doc_comments", "member_profiles"];
+    const session = mingle.startOnboarding(
+      c.req.param("id"),
+      platform,
+      connectionId || undefined,
+      (adding ?? []).filter((id) => known.includes(id)),
+    );
     return c.json({ id: session.id });
   });
 
@@ -1072,6 +1710,19 @@ export function createApi(mingle: Mingle): Hono<Env> {
     return c.json({ ok: true });
   });
 
+  /** Global outbound network proxy configuration and live status (credentials never returned). */
+  app.get("/v1/admin/proxy", async (c) => c.json(await mingle.proxyView(true)));
+
+  app.put("/v1/admin/proxy", async (c) => {
+    const body = await c.req.json<ProxyPatch>();
+    return c.json(await mingle.updateProxy(body));
+  });
+
+  app.post("/v1/admin/proxy/test", async (c) => {
+    const body = await c.req.json<{ url?: string; useSaved?: boolean }>().catch(() => ({}));
+    return c.json(await mingle.testProxy(body));
+  });
+
   return app;
 }
 
@@ -1102,6 +1753,9 @@ function handoffView(h: Handoff) {
   };
 }
 
+/** How long the console's look at the private chat counts as watching it; it reads it every second or so. */
+const CHAT_WATCH_MS = 5000;
+
 function clamp(n: number, min: number, max: number): number {
   return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.trunc(n))) : min;
 }
@@ -1114,10 +1768,20 @@ export function serveConsole(app: Hono<Env>): boolean {
   ];
   const root = candidates.find((dir) => existsSync(resolve(dir, "index.html")));
   if (!root) return false;
+  app.use("/assets/*", async (c, next) => {
+    await next();
+    if (c.res.status === 200) c.res.headers.set("cache-control", "public, max-age=31536000, immutable");
+  });
   app.use("/assets/*", serveStatic({ root }));
   const index = serveStatic({ root, path: "index.html" });
   // Everything that is not the API is the single-page console.
-  app.get("*", (c, next) => (c.req.path.startsWith("/v1/") ? next() : index(c, next)));
+  app.get("*", async (c, next) => {
+    if (c.req.path.startsWith("/v1/")) return next();
+    const res = await index(c, next);
+    const out = res ?? c.res;
+    if (out.status === 200) out.headers.set("cache-control", "no-cache");
+    return res;
+  });
   return true;
 }
 
@@ -1136,4 +1800,18 @@ export function listen(app: Hono<Env>, port: number): Promise<{ url: string; clo
     });
     server.on("error", reject);
   });
+}
+
+/** How a line's work reads to the owner: under way, waiting its turn, waiting for a reply, done, broken. */
+function lineState(task: Task): "running" | "queued" | "waiting" | "done" | "error" | "stopped" {
+  if (task.lineState === "error") return "error";
+  if (task.lineState === "ended" || task.status === "closed") return "stopped";
+  if (task.status === "done") return "done";
+  if (task.lineState === "queued") return "queued";
+  return task.lineState === "running" ? "running" : "waiting";
+}
+
+/** A JSON body as an object to read fields from: `null`, a list or a value reads as having none. */
+function objectBody(body: unknown): Record<string, unknown> {
+  return body !== null && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
 }

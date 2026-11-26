@@ -43,6 +43,11 @@ const OPTIONS = {
   status: { type: "string" },
   at: { type: "string" },
   every: { type: "string" },
+  check: { type: "string" },
+  once: { type: "boolean" },
+  mute: { type: "boolean" },
+  default: { type: "boolean" },
+  for: { type: "string" },
   by: { type: "string" },
   chat: { type: "string" },
   name: { type: "string" },
@@ -58,6 +63,7 @@ const OPTIONS = {
   agent: { type: "string" },
   lines: { type: "string" },
   prompt: { type: "boolean" },
+  bypass: { type: "string" },
 } as const;
 
 type Flags = ReturnType<typeof parse>["values"];
@@ -113,6 +119,31 @@ function adminClient() {
     request<T>(runtime.url, runtime.adminToken, method, path, body);
 }
 
+/** How often a group that hears everything reaches the agent (docs/spec.md 4.2). */
+interface Hearing {
+  pace: "auto" | "every" | "muted";
+  everyMs?: number;
+  slowedMs?: number;
+  tier?: "save" | "balanced" | "fast" | null;
+  defaultTier?: "save" | "balanced" | "fast";
+  aliases?: string[];
+}
+
+function hearingText(h: Hearing): string {
+  if (h.pace === "muted")
+    return "you hear nothing said here until someone @-mentions you or replies to you; then the usual pace is back";
+  if (h.pace === "every")
+    return `you hear what was said here at most once every ${minutes(h.everyMs ?? 0)}, until you change it`;
+  if (h.slowedMs)
+    return `the usual pace, slowed to once every ${minutes(h.slowedMs)} because you left the last stretches unanswered`;
+  return "the usual pace: soon after people pause, at most every few minutes";
+}
+
+function minutes(ms: number): string {
+  const m = Math.round(ms / 60_000);
+  return m % 1440 === 0 ? `${m / 1440}d` : m % 60 === 0 ? `${m / 60}h` : `${m}m`;
+}
+
 interface ContactRow {
   id: string;
   platform: string;
@@ -121,6 +152,7 @@ interface ContactRow {
   owner: boolean;
   bot: boolean;
   person: string | null;
+  profile: string | null;
 }
 
 interface ContactInfo {
@@ -133,17 +165,20 @@ interface ContactInfo {
     owner: boolean;
     bot: boolean;
     linkedBy: "owner" | "agent" | null;
+    profile: string | null;
     chats: { id: string; kind: string; name: string | null }[];
   }[];
 }
 
 const marks = (k: { owner: boolean; bot: boolean }) => `${k.owner ? "  owner" : ""}${k.bot ? "  bot" : ""}`;
+/** Department and title, where the chat app gives them. */
+const where = (k: { profile?: string | null }) => (k.profile ? `  ${JSON.stringify(k.profile)}` : "");
 
 /** One line per account; accounts of one person under the person's line. */
 function contactList(contacts: readonly ContactRow[]): string {
   const line = (k: ContactRow, indent: string) => {
     const given = k.name && k.name !== k.platformName && k.platformName ? `  (${k.platformName} on ${k.platform})` : "";
-    return `${indent}${k.id}  ${k.platform}  ${k.name ? JSON.stringify(k.name) : "no name"}${given}${marks(k)}`;
+    return `${indent}${k.id}  ${k.platform}  ${k.name ? JSON.stringify(k.name) : "no name"}${given}${where(k)}${marks(k)}`;
   };
   const out: string[] = [];
   const done = new Set<string>();
@@ -170,7 +205,7 @@ function contactInfo(found: ContactInfo): string {
   for (const k of found.accounts) {
     const by = k.linkedBy === "owner" ? "  linked by your owner" : k.linkedBy === "agent" ? "  linked by you" : "";
     out.push(
-      `  ${k.id}  ${k.platform}  ${k.platformName ? JSON.stringify(k.platformName) : "no name"}${marks(k)}${by}`,
+      `  ${k.id}  ${k.platform}  ${k.platformName ? JSON.stringify(k.platformName) : "no name"}${where(k)}${marks(k)}${by}`,
     );
     const dm = k.chats.find((c) => c.kind === "dm");
     if (dm) out.push(`    direct chat: ${dm.id}`);
@@ -218,6 +253,8 @@ interface SendReport {
   messages: { id: string }[];
   state: "sent" | "uncertain";
   degraded: string[];
+  mentioned?: { contact: string; name: string }[];
+  unmatched?: string[];
 }
 
 function sendText(report: SendReport): string {
@@ -232,8 +269,16 @@ function sendText(report: SendReport): string {
     files_dropped: "files were not sent",
     markdown_flattened: "formatting is shown as plain text here",
     text_split: "the text was long and went out as several messages",
+    mentions_plain: "this chat app has no mentions a bot can make; the names went out as plain text and notify no one",
   };
+  if (report.mentioned?.length)
+    lines.push(`mentioned ${report.mentioned.map((m) => `@${m.name} (${m.contact})`).join(", ")}`);
   for (const d of report.degraded) if (notes[d]) lines.push(`note: ${notes[d]}`);
+  if (report.unmatched?.length)
+    lines.push(
+      `note: ${report.unmatched.join(", ")} matched no one in this chat and went out as plain text, so nobody was notified. ` +
+        `To mention someone, write @ and their name exactly as "mingle contact list" shows it`,
+    );
   return lines.join("\n");
 }
 
@@ -251,9 +296,10 @@ async function agentCommand(group: string, action: string | undefined, args: str
       return true;
     }
     case "message send": {
-      const to = need(flags.to, "chat_required", "usage: mingle message send --to <chat-id> <<'MSG' ... MSG");
+      // A line may leave --to out: it sends about its task, where that is (docs/spec.md 4.13).
+      const to = flags.to;
       const text = await readStdin();
-      const report = await call()<SendReport>("POST", "/v1/agent/messages/send", { chatId: to, text, files });
+      const report = await call()<SendReport>("POST", "/v1/agent/messages/send", { to, text, files });
       print(report, () => sendText(report));
       return true;
     }
@@ -323,21 +369,75 @@ async function agentCommand(group: string, action: string | undefined, args: str
         platform: string;
         kind: string;
         name: string | null;
-        members: { name: string }[] | null;
+        members: { id: string; name: string; profile: string | null; bot: boolean }[] | null;
+        hearing: Hearing | null;
       }>("GET", `/v1/agent/chats/${chat}`);
       print(info, () =>
         [
           `${info.id}  ${info.platform}  ${info.kind}  ${info.name ?? "-"}`,
+          ...(info.hearing
+            ? [
+                `hears everything: ${hearingText(info.hearing)}`,
+                `keeps up with a conversation: ${info.hearing.tier ?? `${info.hearing.defaultTier ?? "fast"}, by the group's size`} (your owner's choice)`,
+                `also called here: ${info.hearing.aliases?.length ? info.hearing.aliases.join(", ") : "none"}`,
+              ]
+            : []),
           info.members
-            ? `members: ${info.members.map((m) => m.name).join(", ")}`
+            ? [
+                "members:",
+                ...info.members.map(
+                  (m) => `  ${m.id}  ${m.name ? JSON.stringify(m.name) : "no name"}${where(m)}${m.bot ? "  bot" : ""}`,
+                ),
+              ].join("\n")
             : "members: not available on this chat app",
         ].join("\n"),
       );
       return true;
     }
+    case "chat hear": {
+      const usage = "usage: mingle chat hear <chat-id> --every 1h | --mute | --default";
+      const chat = need(args[0], "chat_required", usage);
+      const given = [flags.every !== undefined, flags.mute, flags.default].filter(Boolean).length;
+      if (given !== 1)
+        throw new CliError("flags_conflict", `pass exactly one of --every, --mute and --default; ${usage}`);
+      const hearing = await call()<Hearing & { chat: string }>("PUT", `/v1/agent/chats/${chat}/hearing`, {
+        ...(flags.every !== undefined ? { every: flags.every } : flags.mute ? { mute: true } : { default: true }),
+      });
+      print(hearing, () => `${hearing.chat}: ${hearingText(hearing)}`);
+      return true;
+    }
+    case "chat alias": {
+      const usage = "usage: mingle chat alias <chat-id> add|remove <name>";
+      const chat = need(args[0], "chat_required", usage);
+      const action = args[1];
+      const name = args.slice(2).join(" ").trim();
+      if ((action !== "add" && action !== "remove") || !name) throw new CliError("alias_invalid", usage);
+      const result = await call()<{ chat: string; aliases: string[] }>(
+        action === "add" ? "POST" : "DELETE",
+        `/v1/agent/chats/${chat}/aliases`,
+        { alias: name },
+      );
+      print(
+        result,
+        () =>
+          `${result.chat}: ${result.aliases.length ? `also called ${result.aliases.join(", ")}` : "no other names"}`,
+      );
+      return true;
+    }
     case "contact list": {
-      const contacts = await call()<ContactRow[]>("GET", "/v1/agent/contacts");
-      print(contacts, () => (contacts.length ? contactList(contacts) : "no contacts yet: nobody has messaged you"));
+      const query = args.join(" ").trim();
+      const contacts = await call()<ContactRow[]>(
+        "GET",
+        `/v1/agent/contacts${query ? `?${new URLSearchParams({ q: query })}` : ""}`,
+      );
+      print(contacts, () =>
+        contacts.length
+          ? contactList(contacts)
+          : query
+            ? `no contact named like "${query}". Try part of the name, or "mingle chat info <chat>" for a group's members. ` +
+              "You can reach only people in your chats; if they are not, tell whoever asked"
+            : "no contacts yet: nobody has messaged you",
+      );
       return true;
     }
     case "contact info": {
@@ -408,6 +508,61 @@ async function agentCommand(group: string, action: string | undefined, args: str
       );
       return true;
     }
+    case "task run": {
+      const usage = 'usage: mingle task run "title" --from <message-id>, the brief on standard input';
+      const title = need(args.join(" "), "title_required", usage);
+      const from = need(flags.from, "from_required", usage);
+      const brief = need((await readStdin()).trim(), "brief_required", usage);
+      const task = await call()<{ id: string; title: string; lineState: string; thread?: string }>(
+        "POST",
+        "/v1/agent/tasks/run",
+        { title, from, brief },
+      );
+      // Where people follow the work: a thread under the message where the chat app has them.
+      const where =
+        task.thread === "opens"
+          ? `\nYour acknowledgement (message reply ${from}) opens a thread under it: the work goes on there, the result comes back to the chat.`
+          : task.thread === "existing"
+            ? "\nThe work goes on in the thread the message is in."
+            : "";
+      print(task, () =>
+        task.lineState === "queued"
+          ? `started ${task.id}: ${task.title} (waiting for a free line; it starts by itself)${where}`
+          : `started ${task.id}: ${task.title}; it answers under ${from} itself${where}`,
+      );
+      return true;
+    }
+    case "task tell": {
+      const id = need(
+        args[0],
+        "task_id_required",
+        "usage: mingle task tell <task-id> [--from <message-id>] [note on standard input]",
+      );
+      const note = (await readStdin()).trim();
+      const task = await call()<{ id: string; title: string }>("POST", `/v1/agent/tasks/${id}/tell`, {
+        ...(note ? { text: note } : {}),
+        ...(flags.from ? { from: flags.from } : {}),
+      });
+      print(task, () => `passed on to ${task.id} (${task.title})`);
+      return true;
+    }
+    case "task done": {
+      const id = need(args[0], "task_id_required", "usage: mingle task done <task-id>, the summary on standard input");
+      const summary = need((await readStdin()).trim(), "summary_required", "pass a summary on standard input");
+      const task = await call()<{ id: string; title: string }>("POST", `/v1/agent/tasks/${id}/done`, { summary });
+      print(task, () => `${task.id} is done; your main session gets the summary`);
+      return true;
+    }
+    case "task status": {
+      const text = need(
+        args.join(" ").trim(),
+        "text_required",
+        'usage: mingle task status "Found the cause; fixing it"',
+      );
+      const task = await call()<{ id: string; progress: string | null }>("POST", "/v1/agent/tasks/progress", { text });
+      print(task, () => `${task.id}: ${task.progress ?? ""}`);
+      return true;
+    }
     case "task update": {
       const id = need(args[0], "task_id_required", "usage: mingle task update <task-id> --status done");
       const status = need(flags.status, "status_required", "pass --status todo|in_progress|done|closed");
@@ -419,29 +574,57 @@ async function agentCommand(group: string, action: string | undefined, args: str
       const text = need(
         args.join(" "),
         "text_required",
-        'usage: mingle reminder set "text" --in 6h | --at <time> | --every daily@09:00',
+        'usage: mingle reminder set "text" --in 6h | --at <time> | --every daily@09:00 [--check <command> [--once] [--for 7d|forever]]',
       );
-      const reminder = await call()<{ id: string; nextFireAt: number }>("POST", "/v1/agent/reminders", {
+      const reminder = await call()<{
+        id: string;
+        nextFireAt: number;
+        check: { until: number | null } | null;
+        /** The first run's output, sent back this once; only its hash is kept. */
+        checkOutput?: string | null;
+      }>("POST", "/v1/agent/reminders", {
         text,
         in: flags.in,
         at: flags.at,
         every: flags.every,
         chat: flags.chat,
         from: flags.from,
+        check: flags.check,
+        once: flags.once,
+        for: flags.for,
       });
-      print(reminder, () => `set ${reminder.id}, next at ${time(reminder.nextFireAt)}`);
+      print(reminder, () =>
+        reminder.check
+          ? `set ${reminder.id}, next check at ${time(reminder.nextFireAt)}, checking ${reminder.check.until === null ? "forever" : `until ${time(reminder.check.until)}`}; it fires when the output changes from:\n${reminder.checkOutput || "(empty)"}`
+          : `set ${reminder.id}, next at ${time(reminder.nextFireAt)}`,
+      );
       return true;
     }
     case "reminder list": {
       const reminders = await call()<
-        { id: string; body: string; rule: string; nextFireAt: number; sourceMessageId: string | null }[]
+        {
+          id: string;
+          body: string;
+          rule: string;
+          nextFireAt: number;
+          sourceMessageId: string | null;
+          check: {
+            command: string;
+            once: boolean;
+            failures: number;
+            error: string | null;
+            until: number | null;
+          } | null;
+        }[]
       >("GET", "/v1/agent/reminders");
+      const checkLine = (c: NonNullable<(typeof reminders)[number]["check"]>) =>
+        `\n    check${c.once ? " (once)" : ""} ${c.until === null ? "forever" : `until ${time(c.until)}`}: ${c.command}${c.failures ? `\n    failing ${c.failures}x: ${c.error}` : ""}`;
       print(reminders, () =>
         reminders.length
           ? reminders
               .map(
                 (r) =>
-                  `${r.id}  ${time(r.nextFireAt)}  ${r.rule}  ${r.body}${r.sourceMessageId ? `  (from ${r.sourceMessageId})` : ""}`,
+                  `${r.id}  ${time(r.nextFireAt)}  ${r.rule}  ${r.body}${r.sourceMessageId ? `  (from ${r.sourceMessageId})` : ""}${r.check ? checkLine(r.check) : ""}`,
               )
               .join("\n")
           : "no reminders",
@@ -475,12 +658,22 @@ async function agentCommand(group: string, action: string | undefined, args: str
         harness: string;
         home: string;
         connections: { platform: string; bot: string; state: string }[];
+        line?: string;
+        doing: { id: string; title: string; status: string; line: string | null; from: string | null }[];
       }>("GET", "/v1/agent/whoami");
+      const doing = me.doing.map(
+        (t) => `  ${t.id}  ${t.line === "idle" ? t.status : t.line}  ${t.title}  (from ${t.from})`,
+      );
       print(me, () =>
         [
           `${me.name} (${me.harness})`,
           `home: ${me.home}`,
           ...me.connections.map((c) => `${c.platform}: ${c.bot} ${c.state}`),
+          ...(me.line
+            ? ["", `this session works on ${me.line}`, ...doing]
+            : doing.length
+              ? ["", "doing:", ...doing]
+              : []),
         ].join("\n"),
       );
       return true;
@@ -670,6 +863,59 @@ async function adminCommand(group: string, action: string | undefined, args: str
       print({ url }, () => url);
       return true;
     }
+    case "proxy": {
+      const sub = action;
+      const formatProxy = (p: {
+        mode: string;
+        url: string | null;
+        bypass: string;
+        passToHarness: boolean;
+        effective: { url: string | null; source: string; pacOnly: boolean };
+      }) => {
+        const eff = p.effective.url
+          ? `${p.effective.url} (${p.effective.source})`
+          : p.effective.pacOnly
+            ? "direct (PAC auto-config detected; set manual proxy)"
+            : "direct";
+        return [
+          `mode: ${p.mode}`,
+          `effective: ${eff}`,
+          ...(p.url ? [`manual: ${p.url}`] : []),
+          ...(p.bypass ? [`bypass: ${p.bypass}`] : []),
+          `pass to harness: ${p.passToHarness ? "yes" : "no"}`,
+        ].join("\n");
+      };
+      if (flags.clear !== undefined || sub === "clear") {
+        const view = await adminClient()<Parameters<typeof formatProxy>[0]>("PUT", "/v1/admin/proxy", {
+          mode: "system",
+          url: null,
+        });
+        print(view, () => formatProxy(view));
+        return true;
+      }
+      if (!sub) {
+        const view = await adminClient()<Parameters<typeof formatProxy>[0]>("GET", "/v1/admin/proxy");
+        print(view, () => formatProxy(view));
+        return true;
+      }
+      if (sub === "system" || sub === "off") {
+        const view = await adminClient()<Parameters<typeof formatProxy>[0]>("PUT", "/v1/admin/proxy", { mode: sub });
+        print(view, () => formatProxy(view));
+        return true;
+      }
+      if (sub === "set") {
+        const url = args[0];
+        if (!url) throw new CliError("usage", "mingle proxy set <url> [--bypass <list>]");
+        const view = await adminClient()<Parameters<typeof formatProxy>[0]>("PUT", "/v1/admin/proxy", {
+          mode: "manual",
+          url,
+          ...(flags.bypass !== undefined ? { bypass: flags.bypass } : {}),
+        });
+        print(view, () => formatProxy(view));
+        return true;
+      }
+      throw new CliError("usage", "mingle proxy [system | off | set <url> [--bypass <list>]]");
+    }
   }
   return false;
 }
@@ -758,18 +1004,29 @@ async function start(flags: Flags): Promise<void> {
     } catch {}
   };
   // Loaded here so agent commands, which run often, do not pay for OAR and the server.
-  const [{ createApi, listen, serveConsole }, { loadChannels }, { Mingle }, harnessModule, { defaultSecrets }] =
-    await Promise.all([
-      import("../api/server.ts"),
-      import("../channels/registry.ts"),
-      import("../core/mingle.ts"),
-      import("../harness/harness.ts"),
-      import("../platform/secrets.ts"),
-    ]);
+  const [
+    { createApi, listen, serveConsole },
+    { loadChannels },
+    { Mingle },
+    harnessModule,
+    { defaultSecrets },
+    { installNetworkProxy },
+    { captureShellProxyEnv },
+  ] = await Promise.all([
+    import("../api/server.ts"),
+    import("../channels/registry.ts"),
+    import("../core/mingle.ts"),
+    import("../harness/harness.ts"),
+    import("../platform/secrets.ts"),
+    import("../platform/net.ts"),
+    import("../platform/proxy.ts"),
+  ]);
   // The desktop app starts us with the bare environment the system gives apps. Take the
   // user's login-shell environment, so harness setup in ~/.zshrc (API keys, base URLs,
   // proxies, PATH) works the same as in a terminal.
   if (flags["login-shell-env"]) await adoptLoginShellEnvironment(harnessModule.loginShellEnvironment, log);
+  const shellProxyEnv = captureShellProxyEnv(process.env);
+  const proxy = installNetworkProxy();
   const { oarHarness } = harnessModule;
   const mingle = new Mingle({
     paths,
@@ -778,6 +1035,8 @@ async function start(flags: Flags): Promise<void> {
     channels: await loadChannels(),
     secrets: defaultSecrets(resolve(paths.home, "secrets.json")),
     cliEntry: fileURLToPath(import.meta.url),
+    proxy,
+    shellProxyEnv,
     ...(process.env.MINGLE_COLD_START ? { coldStart: process.env.MINGLE_COLD_START } : {}),
     log,
   });
@@ -809,11 +1068,20 @@ async function start(flags: Flags): Promise<void> {
     rmSync(paths.runtime, { force: true });
     // Never hang on the way out: whoever sent the signal is waiting.
     setTimeout(() => process.exit(0), 10_000).unref();
+    // Running check commands start dying now, not after the server has drained.
+    mingle.beginShutdown();
     // Stop taking requests before the store closes under them.
     await server.close();
     await mingle.stop();
     process.exit(0);
   };
+  process.on("unhandledRejection", (reason) => {
+    const detail = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    log(`unhandled rejection: ${detail}`);
+  });
+  process.on("uncaughtExceptionMonitor", (error) => {
+    log(`uncaught exception: ${error.stack ?? error.message}`);
+  });
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
   // The desktop app holds our stdin open and closes it to stop us. Windows has no
@@ -857,6 +1125,7 @@ const HELP = `mingle ${VERSION}
 For the owner:
   mingle start [--port 7419] [--no-open]   run Mingle in this terminal and open the console
   mingle open                              open the console of the running Mingle
+  mingle proxy [system|off|set <url>]      show or change outbound network proxy settings
   mingle status                            agents and their connections
   mingle harnesses                         harnesses installed on this computer
   mingle agent create --name <n> --harness <id> [--model <m>] [--role <text> | --role-file <path>]
@@ -877,11 +1146,12 @@ For the owner:
   mingle disconnect <connection-id>
 
 For agents (inside a session):
-  mingle message reply <msg> | send --to <chat> | read <chat> | search <words>
-  mingle chat list | info <chat>
-  mingle contact list | info <user> | name <user> "name" | link <user> <user> | unlink <user> | note <user>
+  mingle message reply <msg> | send --to <chat|contact> | read <chat> | search <words>
+  mingle chat list | info <chat> | hear <chat> --every 1h | --mute | --default
+  mingle chat alias <chat> add|remove <name>
+  mingle contact list [name] | info <user> | name <user> "name" | link <user> <user> | unlink <user> | note <user>
   mingle file get <file>
-  mingle task create | list | update
+  mingle task create | run | tell | status | done | list | update
   mingle reminder set | list | snooze | cancel
   mingle whoami | manual
 

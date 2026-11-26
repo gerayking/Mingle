@@ -23,15 +23,27 @@ export class ApiError extends Error {
   }
 }
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+const MAX_ETAG_CACHE = 128;
+const etagCache = new Map<string, { etag: string; value: unknown }>();
+
+export function clearResponseCache(): void {
+  etagCache.clear();
+}
+
+async function call<T>(method: string, path: string, body?: unknown, remote?: string): Promise<T> {
+  if (remote) path = `/v1/admin/ssh/${remote}/${path.slice("/v1/admin/".length)}`;
   let response: Response;
   // Raw bytes (a picture) go as they are; everything else is JSON.
   const raw = body instanceof Blob;
+  const token = sessionStorage.getItem(TOKEN_KEY) ?? "";
+  const cacheKey = method === "GET" ? `${token}\0${path}` : null;
+  const cached = cacheKey ? etagCache.get(cacheKey) : undefined;
   try {
     response = await fetch(path, {
       method,
       headers: {
-        authorization: `Bearer ${sessionStorage.getItem(TOKEN_KEY) ?? ""}`,
+        authorization: `Bearer ${token}`,
+        ...(cached ? { "if-none-match": cached.etag } : {}),
         ...(body !== undefined ? { "content-type": raw ? body.type : "application/json" } : {}),
       },
       ...(body !== undefined ? { body: raw ? body : JSON.stringify(body) } : {}),
@@ -39,10 +51,28 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   } catch {
     throw new ApiError("offline", "", 0);
   }
+  if (response.status === 304 && cached) {
+    // Refresh recency and return the exact previous object reference so React skips re-renders.
+    etagCache.delete(cacheKey as string);
+    etagCache.set(cacheKey as string, cached);
+    return cached.value as T;
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
+    if (response.status === 401) etagCache.clear();
     const error = payload as { error?: string; next?: string };
     throw new ApiError(error.error ?? "http_error", error.next ?? response.statusText, response.status);
+  }
+  if (cacheKey) {
+    const etag = response.headers.get("etag");
+    if (etag) {
+      etagCache.delete(cacheKey);
+      if (etagCache.size >= MAX_ETAG_CACHE) {
+        const oldest = etagCache.keys().next().value;
+        if (oldest !== undefined) etagCache.delete(oldest);
+      }
+      etagCache.set(cacheKey, { etag, value: payload });
+    }
   }
   return payload as T;
 }
@@ -58,7 +88,9 @@ export type Platform =
   | "discord"
   | "telegram"
   | "imessage"
-  | "github";
+  | "github"
+  /** The owner's private chat in the console (docs/spec.md 6.9): built in, never a chat app in the lists. */
+  | "local";
 
 export interface ConnectionView {
   id: string;
@@ -89,11 +121,16 @@ export interface ConnectionView {
 
 /**
  * A permission the owner grants the bot on the platform itself (docs/spec.md 4.2). `group_messages`:
- * every message in its groups, not only the ones that @ it. `grant.steps` picks the instructions.
+ * every message in its groups, not only the ones that @ it. `bot_messages`: what other bots send in
+ * its groups (Feishu only). `grant.steps` picks the instructions.
  */
+export type PermissionId = "group_messages" | "bot_messages" | "doc_comments" | "member_profiles";
+
 export interface BotPermission {
-  id: "group_messages";
+  id: PermissionId;
   granted: boolean;
+  /** Not asked for when the bot is created; the owner turns it on here (Feishu member profiles). */
+  optional?: boolean;
   grant?: { url: string; steps?: "telegram" | "discord" };
 }
 
@@ -122,7 +159,25 @@ export interface AccessEntry {
   access: "allowed" | "blocked";
 }
 
+export interface SshHost {
+  id: string;
+  host: string;
+  home: string;
+  reachable: boolean | null;
+}
+
+export interface SshInstallJob {
+  id: string;
+  host: string;
+  home: string;
+  state: "running" | "done" | "failed";
+  phase: "installing" | "preparing";
+  result?: SshHost;
+  error?: string;
+}
+
 export interface AgentView {
+  remote?: { id: string; host: string; reachable: boolean };
   id: string;
   slug: string;
   name: string;
@@ -143,8 +198,48 @@ export interface AgentView {
   connections: ConnectionView[];
   /** Ask about new people and groups on every chat app, not only the public ones. */
   askAll: boolean;
+  /** The daily memory tidy-up while the agent is idle (docs/spec.md 4.5). */
+  tidy: boolean;
   requests: AccessRequest[];
+  /** Things under way at once besides talking: its lines working or waiting their turn (docs/spec.md 4.13). */
+  doing: number;
+  /**
+   * The private chat (docs/spec.md 6.9): what the agent said there that the owner has not seen yet.
+   * Absent from a host on a Mingle older than the private chat.
+   */
+  chat?: { unread: number; last: { id: string; preview: string; at: number } | null };
 }
+
+/** A file in the private chat, sent or received. */
+export interface ChatFile {
+  id: string;
+  name: string;
+  size: number | null;
+  mime: string | null;
+}
+
+/** One message of the private chat (docs/spec.md 6.9). */
+export interface ChatMessage {
+  id: string;
+  direction: "in" | "out";
+  body: string;
+  state: string;
+  retryAt: number | null;
+  createdAt: number;
+  files: ChatFile[];
+  line: { id: string; title: string; state: LineState; started: boolean } | null;
+}
+
+/** A file the owner attached and has not sent yet. */
+export interface ChatUpload {
+  id: string;
+  name: string;
+  size: number;
+  mime?: string;
+}
+
+/** Where a piece of work an agent is doing on the side stands (docs/spec.md 4.13). */
+export type LineState = "running" | "queued" | "waiting" | "done" | "error" | "stopped";
 
 /** One chat app account in the agent's address book. */
 export interface ContactAccount {
@@ -162,6 +257,8 @@ export interface ContactAccount {
   ownerShared: boolean;
   bot: boolean;
   linkedBy: "owner" | "agent" | null;
+  /** Department and title from the chat app, where member profiles are on. */
+  profile: string | null;
 }
 
 /** A person with their accounts, or one account on its own (`person` null). */
@@ -204,6 +301,71 @@ export interface Activity {
   retryAt: number | null;
   files: string[];
   createdAt: number;
+  /** The work this message started, or the work it was handed to. */
+  line: { id: string; title: string; state: LineState; started: boolean } | null;
+}
+
+/** How often a group that hears everything reaches the agent. */
+export type HearTier = "save" | "balanced" | "fast";
+
+export interface Hearing {
+  pace: "auto" | "every" | "muted";
+  everyMs?: number;
+  slowedMs?: number;
+  /**
+   * Since 0.4.7 (RFC 0001), absent from a host on an older Mingle: how fast it keeps up with a
+   * conversation as the owner chose (null follows the group's size). Read through `hearingSettings`.
+   */
+  tier?: HearTier | null;
+  /** The tier the group's size gives it. */
+  defaultTier?: HearTier;
+  /** The people it is in a conversation with now, by name. */
+  live?: string[];
+  /** Other names that count as calling it in this group. */
+  aliases?: string[];
+}
+
+/** A group's tier, names and who it is talking with, as set from the console (docs/spec.md 4.2). */
+export interface HearingSettings {
+  tier: HearTier | null;
+  defaultTier: HearTier;
+  live: string[];
+  aliases: string[];
+}
+
+const TIERS: readonly string[] = ["save", "balanced", "fast"];
+
+/**
+ * The settings in a group's hearing, or null when its host runs a Mingle from before them (an SSH
+ * host on 0.4.6 sends only the pace): then the console shows the switch and the pace as before.
+ */
+export function hearingSettings(h: Hearing | null | undefined): HearingSettings | null {
+  if (!h || !Array.isArray(h.aliases) || !Array.isArray(h.live)) return null;
+  if (typeof h.defaultTier !== "string" || !TIERS.includes(h.defaultTier)) return null;
+  const tier = h.tier === null || (typeof h.tier === "string" && TIERS.includes(h.tier)) ? h.tier : null;
+  return {
+    tier,
+    defaultTier: h.defaultTier,
+    live: h.live.filter((n): n is string => typeof n === "string"),
+    aliases: h.aliases.filter((n): n is string => typeof n === "string"),
+  };
+}
+
+/** One chat in the activity, with its latest messages (oldest first) and what still needs the owner. */
+export interface Conversation {
+  chat: { id: string; kind: "dm" | "group" | "thread"; name: string | null };
+  /** The channel a thread belongs to. */
+  parent: { id: string; kind: "dm" | "group" | "thread"; name: string | null } | null;
+  platform: Platform;
+  /** A group: whether it hears everything said there. Null where that cannot be set (docs/spec.md 4.2). */
+  listen: boolean | null;
+  /** A group that hears everything: the pace the agent set, or the slowing in force (docs/spec.md 4.2). */
+  hearing: Hearing | null;
+  latestAt: number;
+  /** Older messages not shown; read them with `cursor` as `before`. */
+  earlier: number;
+  cursor: number | null;
+  messages: Activity[];
 }
 
 export interface Harness {
@@ -327,6 +489,16 @@ export interface Task {
   id: string;
   title: string;
   status: string;
+  /** Worked on in a line of its own; null for a task that is only a note. */
+  line: LineState | null;
+  summary: string | null;
+  /** How far the line is, in one line: the latest it said in its thread, or reported. */
+  progress: string | null;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+  /** The chat it came from. */
+  from: { name: string | null; platform: Platform | undefined } | null;
 }
 
 export interface Reminder {
@@ -335,13 +507,57 @@ export interface Reminder {
   rule: string;
   nextFireAt: number | null;
   lastFiredAt: number | null;
+  /** A command Mingle runs on the rule; the reminder fires when its output changes. */
+  check: {
+    command: string;
+    once: boolean;
+    failures: number;
+    error: string | null;
+    lastCheckedAt?: number | null;
+    until?: number | null;
+  } | null;
 }
+
+export type ProxyMode = "system" | "manual" | "off";
+
+export interface ProxyView {
+  mode: ProxyMode;
+  url: string | null;
+  hasAuth: boolean;
+  authMissing: boolean;
+  bypass: string;
+  passToHarness: boolean;
+  effective: {
+    url: string | null;
+    source: "os" | "env" | "manual" | "none";
+    pacOnly: boolean;
+  };
+}
+
+export interface ProxyPatch {
+  mode?: ProxyMode;
+  url?: string | null;
+  keepAuth?: boolean;
+  bypass?: string;
+  passToHarness?: boolean;
+}
+
+export type ProxyTestResult =
+  | { ok: true; latencyMs: number }
+  | { ok: false; code: "proxy_timeout" | "proxy_auth_failed" | "proxy_unreachable" };
 
 export const api = {
   status: () => call<{ version: string; agents: AgentView[] }>("GET", "/v1/admin/status"),
-  harnesses: () => call<Harness[]>("GET", "/v1/admin/harnesses"),
+  sshHosts: () => call<SshHost[]>("GET", "/v1/admin/ssh/hosts"),
+  sshConfig: () => call<{ hosts: string[]; incomplete: boolean }>("GET", "/v1/admin/ssh/config"),
+  addSshHost: (host: string, home: string) => call<SshHost>("POST", "/v1/admin/ssh/hosts", { host, home }),
+  installSshHost: (host: string, home: string) =>
+    call<SshInstallJob>("POST", "/v1/admin/ssh/installations", { host, home }),
+  sshInstallation: (id: string) => call<SshInstallJob>("GET", `/v1/admin/ssh/installations/${id}`),
+  harnesses: (remote?: string) => call<Harness[]>("GET", "/v1/admin/harnesses", undefined, remote),
   /** The last catalog Mingle found at once; `fresh` probes every harness again, a second or more. */
-  brains: (fresh = false) => call<BrainStatus[]>("GET", `/v1/admin/brains${fresh ? "?fresh=1" : ""}`),
+  brains: (fresh = false, remote?: string) =>
+    call<BrainStatus[]>("GET", `/v1/admin/brains${fresh ? "?fresh=1" : ""}`, undefined, remote),
   signInState: (harness: string) => call<SignInState>("GET", `/v1/admin/brains/${harness}/sign-in`),
   installPlan: (harness: string) => call<InstallPlan>("GET", `/v1/admin/brains/${harness}/install-plan`),
   install: (harness: string) => call<Job>("POST", `/v1/admin/brains/${harness}/install`),
@@ -355,12 +571,14 @@ export const api = {
   models: (harness: string) => call<ModelList>("GET", `/v1/admin/harnesses/${harness}/models`),
   updateAgent: (id: string, patch: { name?: string; harness?: string; model?: string | null }) =>
     call<AgentView>("PATCH", `/v1/admin/agents/${id}`, patch),
-  platforms: () => call<PlatformInfo[]>("GET", "/v1/admin/platforms"),
-  setup: (platform: Platform) => call<SetupState>("GET", `/v1/admin/platforms/${platform}/setup`),
-  setupAction: (platform: Platform, action: string) =>
-    call<SetupState>("POST", `/v1/admin/platforms/${platform}/setup/${action}`),
+  platforms: (remote?: string) => call<PlatformInfo[]>("GET", "/v1/admin/platforms", undefined, remote),
+  setup: (platform: Platform, remote?: string) =>
+    call<SetupState>("GET", `/v1/admin/platforms/${platform}/setup`, undefined, remote),
+  setupAction: (platform: Platform, action: string, remote?: string) =>
+    call<SetupState>("POST", `/v1/admin/platforms/${platform}/setup/${action}`, undefined, remote),
   createAgent: (input: { name: string; role: string; harness: string; model?: string }) =>
     call<AgentView>("POST", "/v1/admin/agents", input),
+  reorderAgents: (ids: string[]) => call<{ ids: string[] }>("PUT", "/v1/admin/agents/order", { ids }),
   setAvatar: (id: string, image: Blob) => call<AgentView>("PUT", `/v1/admin/agents/${id}/avatar`, image),
   clearAvatar: (id: string) => call<AgentView>("DELETE", `/v1/admin/agents/${id}/avatar`),
   setRole: (id: string, role: string) => call("PUT", `/v1/admin/agents/${id}/role`, { role }),
@@ -391,8 +609,18 @@ export const api = {
       `/v1/admin/agents/${id}/${kind === "contact" ? "contacts" : "chats"}/${targetId}/access`,
       { access },
     ),
+  setListen: (id: string, chatId: string, listen: boolean) =>
+    call<{ listen: boolean }>("PUT", `/v1/admin/agents/${id}/chats/${chatId}/listen`, { listen }),
+  resetHearing: (id: string, chatId: string) =>
+    call<Hearing>("DELETE", `/v1/admin/agents/${id}/chats/${chatId}/hearing`),
+  setHearTier: (id: string, chatId: string, tier: HearTier | null) =>
+    call<Hearing>("PUT", `/v1/admin/agents/${id}/chats/${chatId}/hearing`, { tier }),
+  /** One name at a time, applied on the server to the list as it is now. */
+  alias: (id: string, chatId: string, alias: string, add: boolean) =>
+    call<Hearing>(add ? "POST" : "DELETE", `/v1/admin/agents/${id}/chats/${chatId}/aliases`, { alias }),
   access: (id: string) => call<AccessEntry[]>("GET", `/v1/admin/agents/${id}/access`),
   setAskAll: (id: string, on: boolean) => call<AgentView>("PUT", `/v1/admin/agents/${id}/ask-all`, { on }),
+  setTidy: (id: string, on: boolean) => call<AgentView>("PUT", `/v1/admin/agents/${id}/tidy`, { on }),
   contacts: (id: string) => call<ContactEntry[]>("GET", `/v1/admin/agents/${id}/contacts`),
   /** Name, note (on the person) or bot mark; fields left out stay. */
   editContact: (id: string, contactId: string, patch: { name?: string; note?: string; bot?: boolean }) =>
@@ -406,7 +634,53 @@ export const api = {
     call<{ person: string }>("POST", `/v1/admin/agents/${id}/people/link`, { contacts }),
   unlinkContact: (id: string, contact: string) =>
     call<{ ok: true }>("POST", `/v1/admin/agents/${id}/people/unlink`, { contact }),
-  activity: (id: string) => call<Activity[]>("GET", `/v1/admin/agents/${id}/activity?limit=30`),
+  conversations: (id: string, page?: { chat: string; before: number }) =>
+    call<Conversation[]>(
+      "GET",
+      `/v1/admin/agents/${id}/conversations${page ? `?chat=${encodeURIComponent(page.chat)}&before=${page.before}&messages=20` : ""}`,
+    ),
+  /** The private chat, newest last; `watching` while the console shows it, so what is there counts as seen. */
+  chat: (id: string, options: { before?: string; watching?: boolean } = {}) =>
+    call<{ messages: ChatMessage[]; more: boolean }>(
+      "GET",
+      `/v1/admin/agents/${id}/chat?limit=50${options.before ? `&before=${encodeURIComponent(options.before)}` : ""}${options.watching ? "&watching=1" : ""}`,
+    ),
+  say: (id: string, text: string, files: string[]) =>
+    call<ChatMessage>("POST", `/v1/admin/agents/${id}/chat`, { text, files }),
+  /** Keep a file to send with the next message. */
+  upload: async (id: string, file: File): Promise<ChatUpload> => {
+    let response: Response;
+    try {
+      response = await fetch(`/v1/admin/agents/${id}/chat/uploads`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${sessionStorage.getItem(TOKEN_KEY) ?? ""}`,
+          "content-type": file.type || "application/octet-stream",
+          "x-file-name": encodeURIComponent(file.name),
+        },
+        body: file,
+      });
+    } catch {
+      throw new ApiError("offline", "", 0);
+    }
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = payload as { error?: string; next?: string };
+      throw new ApiError(error.error ?? "http_error", error.next ?? response.statusText, response.status);
+    }
+    return payload as ChatUpload;
+  },
+  /** A file of the private chat, as bytes to show or save. */
+  chatFile: async (id: string, fileId: string): Promise<Blob> => {
+    const response = await fetch(`/v1/admin/agents/${id}/chat/files/${fileId}`, {
+      headers: { authorization: `Bearer ${sessionStorage.getItem(TOKEN_KEY) ?? ""}` },
+    }).catch(() => {
+      throw new ApiError("offline", "", 0);
+    });
+    if (!response.ok) throw new ApiError("file_not_found", "", response.status);
+    return response.blob();
+  },
+  revealFile: (id: string, fileId: string) => call("POST", `/v1/admin/agents/${id}/chat/files/${fileId}/reveal`),
   handoffs: (id: string) => call<HandoffView[]>("GET", `/v1/admin/agents/${id}/handoffs?limit=30`),
   handoff: (id: string, body: string) =>
     call<{ handoff: HandoffView; state: "idle" | "busy" | "paused" }>("POST", `/v1/admin/agents/${id}/handoffs`, {
@@ -432,12 +706,17 @@ export const api = {
   /** A fresh code for claiming a bot that has no owner yet. */
   claim: (connectionId: string) =>
     call<{ code: string; expiresAt: number }>("POST", `/v1/admin/connections/${connectionId}/claim`),
-  startOnboarding: (id: string, platform: Platform, connectionId?: string) =>
+  startOnboarding: (id: string, platform: Platform, connectionId?: string, adding?: readonly PermissionId[]) =>
     call<{ id: string }>("POST", `/v1/admin/agents/${id}/onboarding`, {
       platform,
       ...(connectionId ? { connectionId } : {}),
+      ...(adding?.length ? { adding } : {}),
     }),
   onboarding: (id: string) => call<OnboardingState>("GET", `/v1/admin/onboarding/${id}`),
   cancelOnboarding: (id: string) => call("DELETE", `/v1/admin/onboarding/${id}`),
   submitCode: (id: string, code: string) => call("POST", `/v1/admin/onboarding/${id}/code`, { code }),
+  proxy: () => call<ProxyView>("GET", "/v1/admin/proxy"),
+  setProxy: (patch: ProxyPatch) => call<ProxyView>("PUT", "/v1/admin/proxy", patch),
+  testProxy: (input: { url?: string; useSaved?: boolean }) =>
+    call<ProxyTestResult>("POST", "/v1/admin/proxy/test", input),
 };

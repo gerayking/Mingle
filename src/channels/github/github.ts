@@ -14,6 +14,7 @@ import type {
   ReactionState,
   SendResult,
 } from "../channel.ts";
+import { renderMentions } from "../mention.ts";
 
 /**
  * GitHub: the agent is a machine account people @-mention in issues and pull requests
@@ -102,6 +103,8 @@ const CAPABILITIES: Capabilities = {
   fileUpload: false,
   fileDownload: false,
   listMembers: false,
+  // `@login` is the mention; a name given to the person is written as their login.
+  mentions: true,
   maxTextLength: 65_536,
 };
 
@@ -485,19 +488,18 @@ export function githubChannel(options: GitHubOptions = {}): Channel {
             // The API cannot attach files to a comment; with no text there is nothing to post.
             return { kind: "failed", code: "unknown", retryable: false, detail: "files_unsupported" };
           }
+          const body = renderMentions(message.text, message.mentions, (m) => `@${m.id}`);
           try {
             const review = message.replyTo ? reviewRoot(message.replyTo) : undefined;
             if (review) {
               const sent = await api.call<GhComment>(
                 "POST",
                 `/repos/${repo}/pulls/${number}/comments/${review}/replies`,
-                { body: message.text },
+                { body },
               );
               return { kind: "sent", platformId: `rc:${sent.id}@${review}`, ...(degraded ? { degraded } : {}) };
             }
-            const sent = await api.call<GhComment>("POST", `/repos/${repo}/issues/${number}/comments`, {
-              body: message.text,
-            });
+            const sent = await api.call<GhComment>("POST", `/repos/${repo}/issues/${number}/comments`, { body });
             return { kind: "sent", platformId: `ic:${sent.id}`, ...(degraded ? { degraded } : {}) };
           } catch (error) {
             return sendFailure(error);

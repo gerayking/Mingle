@@ -126,7 +126,7 @@ describe("people from the agent and the console", () => {
       for (const id of messageIds(t.input)) await runCli(env, ["message", "reply", id], "ok");
     });
     const { mingle, channel, agentId, turns, admin } = current;
-    const telegram = mingle.store.connections(agentId)[0] as { id: string };
+    const telegram = mingle.store.connections(agentId).filter((n) => n.platform !== "local")[0] as { id: string };
     mingle.store.updateConnection(telegram.id, { ownerId: "me" });
     channel.receive({
       text: "hi",

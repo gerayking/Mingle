@@ -20,6 +20,7 @@ import type {
   ReactionState,
   SendResult,
 } from "../channel.ts";
+import { type Mention, renderMentions } from "../mention.ts";
 
 /**
  * Discord through the Gateway: the bot opens a WebSocket to Discord, so no public address
@@ -56,6 +57,9 @@ const CAPABILITIES: Capabilities = {
   fileUpload: true,
   fileDownload: true,
   listMembers: false,
+  mentions: true,
+  // A thread started from a message (needs Create Public Threads; without it, a quoted reply).
+  threads: true,
   // A message holds 2,000 characters; leave room for what the adapter adds.
   maxTextLength: 1_900,
 };
@@ -195,6 +199,7 @@ export function discordChannel(options: DiscordOptions = {}): Channel {
 
   return {
     platform: "discord",
+    groupMessages: true,
     onboarding: {
       kind: "credentials",
       setupUrl: "https://discord.com/developers/applications",
@@ -257,7 +262,13 @@ export function discordChannel(options: DiscordOptions = {}): Channel {
           if (fetched) learnChannel({ ...fetched, guild_id: fetched.guild_id ?? message.guild_id });
           known = channels.get(message.channel_id) ?? { kind: "group" };
         }
-        return { platformId: message.channel_id, kind: known.kind, ...(known.name ? { name: known.name } : {}) };
+        return {
+          platformId: message.channel_id,
+          kind: known.kind,
+          ...(known.name ? { name: known.name } : {}),
+          // A thread is one conversation: once the agent spoke in it, people go on without an @.
+          ...(known.kind === "thread" ? { followUp: true as const } : {}),
+        };
       };
 
       // ------------------------------------------------------------ gateway
@@ -461,6 +472,29 @@ export function discordChannel(options: DiscordOptions = {}): Channel {
         const sent = await request<{ id: string }>("POST", `/channels/${chat.platformId}/messages`, payload);
         return { id: sent.id, degraded: [...new Set(degraded)] };
       };
+      /**
+       * A public thread from the message (docs/spec.md 4.13). Its ID is the message's: one that was
+       * already started is used as it is. Without Create Public Threads, none.
+       */
+      const startThread = async (chat: ChatRef, messageId: string, title: string): Promise<{ thread?: ChatRef }> => {
+        const name = title.replace(/\s+/g, " ").trim().slice(0, 100) || "Thread";
+        const thread = (id: string): ChatRef => {
+          channels.set(id, { kind: "thread", name: `#${name}` });
+          return { platformId: id, kind: "thread", name: `#${name}`, followUp: true };
+        };
+        try {
+          const started = await request<{ id: string }>(
+            "POST",
+            `/channels/${chat.platformId}/messages/${messageId}/threads`,
+            { name, auto_archive_duration: 1440 },
+          );
+          return { thread: thread(started.id) };
+        } catch (error) {
+          // 160004: a thread was already created for this message.
+          if (error instanceof DiscordError && error.code === 160004) return { thread: thread(messageId) };
+          return {};
+        }
+      };
       const edit = (chat: ChatRef, id: string, content: string) =>
         request("PATCH", `/channels/${chat.platformId}/messages/${id}`, {
           content,
@@ -508,12 +542,21 @@ export function discordChannel(options: DiscordOptions = {}): Channel {
 
         async send(message: OutboundMessage): Promise<SendResult> {
           try {
-            const sent = await post(message.chat, message.text.trim(), message.replyTo, [...(message.files ?? [])]);
+            const text = discordMentions(message.text.trim(), message.mentions);
+            const opening =
+              message.inThread && message.replyTo && message.chat.kind === "group"
+                ? await startThread(message.chat, message.replyTo, message.inThread.title)
+                : undefined;
+            const sent = opening?.thread
+              ? await post(opening.thread, text, undefined, [...(message.files ?? [])])
+              : await post(message.chat, text, message.replyTo, [...(message.files ?? [])]);
             if (!sent.id) return { kind: "failed", code: "too_large", retryable: false };
+            const degraded = [...sent.degraded, ...(opening && !opening.thread ? ["thread_dropped" as const] : [])];
             return {
               kind: "sent",
               platformId: sent.id,
-              ...(sent.degraded.length ? { degraded: sent.degraded } : {}),
+              ...(degraded.length ? { degraded } : {}),
+              ...(opening?.thread ? { thread: opening.thread } : {}),
             };
           } catch (error) {
             return sendFailure(error);
@@ -536,9 +579,9 @@ export function discordChannel(options: DiscordOptions = {}): Channel {
               last = markdown;
               await edit(chat, id, markdown).catch(() => {});
             },
-            finish: async (markdown) => {
+            finish: async (markdown, mentions) => {
               try {
-                await edit(chat, id, markdown);
+                await edit(chat, id, discordMentions(markdown, mentions));
                 return { kind: "sent", platformId: id };
               } catch (error) {
                 return sendFailure(error);
@@ -561,9 +604,18 @@ export function discordChannel(options: DiscordOptions = {}): Channel {
         },
 
         /** Works once the user shares a server with the bot. */
+        async openDirect(userId: string) {
+          return (await request<{ id: string }>("POST", "/users/@me/channels", { recipient_id: userId })).id;
+        },
+
+        /** Works once the user shares a server with the bot. */
         async messageUser(userId: string, text: string) {
           const dm = await request<{ id: string }>("POST", "/users/@me/channels", { recipient_id: userId });
-          await request("POST", `/channels/${dm.id}/messages`, { content: text, allowed_mentions: { parse: [] } });
+          const sent = await request<{ id: string }>("POST", `/channels/${dm.id}/messages`, {
+            content: text,
+            allowed_mentions: { parse: [] },
+          });
+          return { chat: dm.id, platformId: sent.id };
         },
 
         async listMembers() {
@@ -595,9 +647,13 @@ export function toInbound(message: DiscordMessage, botId: string, chat: ChatRef)
   const repliedToMe = message.referenced_message?.author?.id === botId;
 
   let text = message.content.replace(new RegExp(`<@!?${botId}>`, "g"), "");
+  const others: { id: string; name: string; isBot: boolean }[] = [];
   for (const u of message.mentions ?? []) {
     if (u.id === botId) continue;
-    text = text.replace(new RegExp(`<@!?${u.id}>`, "g"), `@${displayName(u, u.member)}`);
+    const typedHere = new RegExp(`<@!?${u.id}>`, "g");
+    // Typed, not the ping a reply adds.
+    if (typedHere.test(text)) others.push({ id: u.id, name: displayName(u, u.member), isBot: Boolean(u.bot) });
+    text = text.replace(typedHere, `@${displayName(u, u.member)}`);
   }
   text = text.replace(/[ \t]{2,}/g, " ").trim();
 
@@ -621,8 +677,13 @@ export function toInbound(message: DiscordMessage, botId: string, chat: ChatRef)
     ...(message.message_reference?.message_id ? { replyTo: message.message_reference.message_id } : {}),
     addressedToBot: chat.kind === "dm" || mentioned || repliedToMe,
     mentioned: typed,
+    ...(others.length ? { mentions: others } : {}),
     sentAt: Date.parse(message.timestamp) || Date.now(),
   };
+}
+
+function discordMentions(markdown: string, mentions: readonly Mention[] | undefined): string {
+  return renderMentions(markdown, mentions, (m) => `<@${m.id}>`);
 }
 
 function sendFailure(error: unknown): SendResult {

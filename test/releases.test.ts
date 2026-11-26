@@ -792,6 +792,129 @@ describe("site build", () => {
     expect(llms).toContain("v9.8.7");
     expect(llms).toContain("release notes");
     expect(en).toContain("/releases/latest/download/install.sh");
+    // Hero LCP poster is preloaded while the video uses preload="none"; hidden/below-the-fold screenshots stay lazy.
+    expect(en).toContain('<link rel="preload" as="image" href="/media/mingle-film-en-poster.webp">');
+    expect(en).toContain('poster="/media/mingle-film-en-poster.webp"');
+    expect(en).toContain('src="/img/agent-en-light.png"');
+    expect(en).toMatch(/<img src="\/img\/agent-en-light\.png"[^>]*loading="lazy"/);
+    expect(en).toMatch(/<img src="\/img\/new-en-light\.png"[^>]*loading="lazy"/);
+    // Structured data: SoftwareApplication + FAQPage in both languages, using the snapshot version.
+    for (const [html, lang, path] of [
+      [en, "en", "/"],
+      [zh, "zh-CN", "/zh/"],
+    ] as const) {
+      const blocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].map(
+        (m) => JSON.parse(must(m[1])) as Record<string, unknown>,
+      );
+      const app = blocks.find((b) => b["@type"] === "SoftwareApplication");
+      const faq = blocks.find((b) => b["@type"] === "FAQPage");
+      expect(app).toBeDefined();
+      expect(app?.softwareVersion).toBe(VERSION);
+      expect(app?.inLanguage).toBe(lang);
+      expect(app?.url).toBe(`https://mingle.build${path}`);
+      expect(app?.downloadUrl).toBe(`${REPO_URL}/releases/tag/${TAG}`);
+      expect(faq).toBeDefined();
+      expect((must(faq).mainEntity as unknown[]).length).toBeGreaterThanOrEqual(4);
+      const graphBlock = blocks.find((b) => Array.isArray(b["@graph"]));
+      expect(graphBlock).toBeDefined();
+      expect(html).toContain('type="text/markdown" href="https://mingle.build/llms-full.txt"');
+      expect(html).toContain('type="image/webp"');
+    }
+    expect(en).toContain('property="og:image" content="https://mingle.build/img/og/home-en.png"');
+    expect(zh).toContain('property="og:image" content="https://mingle.build/img/og/home-zh.png"');
+    // Full LLM documentation and IndexNow verification file.
+    const llmsFull = readFileSync(join(out, "llms-full.txt"), "utf8");
+    expect(llms).toContain("https://mingle.build/llms-full.txt");
+    expect(llmsFull).toContain("## Channel capability matrix");
+    expect(llmsFull).toContain(`v${VERSION}`);
+    expect(readFileSync(join(out, "7f4c9a2e8b1d4f6a9c3e5b7d2a8f4c1e.txt"), "utf8").trim()).toBe(
+      "7f4c9a2e8b1d4f6a9c3e5b7d2a8f4c1e",
+    );
+    // Bilingual integration, harness, security, and compare pages + sitemap.xml + llms.txt.
+    const sitemap = readFileSync(join(out, "sitemap.xml"), "utf8");
+    const apps = ["slack", "discord", "telegram", "imessage", "feishu", "wechat", "wecom", "dingtalk", "qq", "github"];
+    const harnessSlugs = ["claude-code", "codex", "opencode", "kimi-code"];
+    expect(sitemap.match(/<url>/g)).toHaveLength(2 + apps.length * 2 + harnessSlugs.length * 2 + 4);
+    expect(sitemap).toContain('xmlns:xhtml="http://www.w3.org/1999/xhtml"');
+    expect(sitemap).toContain("<lastmod>");
+    expect(sitemap).toContain('xhtml:link rel="alternate" hreflang="zh-CN"');
+    for (const app of apps) {
+      expect(en).toContain(`href="/${app}/"`);
+      expect(zh).toContain(`href="/zh/${app}/"`);
+      expect(llms).toContain(`https://mingle.build/${app}/`);
+      expect(llmsFull).toContain(`https://mingle.build/${app}/`);
+      for (const [lang, ogLang, relPath, filePath] of [
+        ["en", "en", `/${app}/`, join(out, app, "index.html")],
+        ["zh-CN", "zh", `/zh/${app}/`, join(out, "zh", app, "index.html")],
+      ] as const) {
+        expect(sitemap).toContain(`<loc>https://mingle.build${relPath}</loc>`);
+        const html = readFileSync(filePath, "utf8");
+        expect(html).toContain(`<link rel="canonical" href="https://mingle.build${relPath}">`);
+        expect(html).toContain(`href="https://mingle.build/${app}/"`);
+        expect(html).toContain(`href="https://mingle.build/zh/${app}/"`);
+        expect(html).toContain(`property="og:image" content="https://mingle.build/img/og/${app}-${ogLang}.png"`);
+        expect(html).toContain(`${dl}/mingle-${VERSION}-arm64.dmg`);
+        expect(html).not.toContain(`mingle-${pkg.version}-`);
+        expect(html).not.toContain("aren't signed");
+        expect(html).not.toContain("暂未签名");
+        const blocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].map(
+          (m) => JSON.parse(must(m[1])) as Record<string, unknown>,
+        );
+        const appLd = blocks.find((b) => b["@type"] === "SoftwareApplication");
+        const crumbLd = blocks.find((b) => b["@type"] === "BreadcrumbList");
+        const faqLd = blocks.find((b) => b["@type"] === "FAQPage");
+        expect(appLd?.inLanguage).toBe(lang);
+        expect(appLd?.softwareVersion).toBe(VERSION);
+        expect(crumbLd).toBeDefined();
+        expect((must(faqLd).mainEntity as unknown[]).length).toBeGreaterThanOrEqual(3);
+      }
+    }
+    for (const slug of harnessSlugs) {
+      expect(en).toContain(`href="/${slug}/"`);
+      expect(zh).toContain(`href="/zh/${slug}/"`);
+      expect(llms).toContain(`https://mingle.build/${slug}/`);
+      for (const [lang, ogLang, relPath, filePath] of [
+        ["en", "en", `/${slug}/`, join(out, slug, "index.html")],
+        ["zh-CN", "zh", `/zh/${slug}/`, join(out, "zh", slug, "index.html")],
+      ] as const) {
+        expect(sitemap).toContain(`<loc>https://mingle.build${relPath}</loc>`);
+        const html = readFileSync(filePath, "utf8");
+        expect(html).toContain(`<link rel="canonical" href="https://mingle.build${relPath}">`);
+        expect(html).toContain(`property="og:image" content="https://mingle.build/img/og/${slug}-${ogLang}.png"`);
+        expect(html).toContain(`${dl}/mingle-${VERSION}-arm64.dmg`);
+        const blocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].map(
+          (m) => JSON.parse(must(m[1])) as Record<string, unknown>,
+        );
+        expect(blocks.find((b) => b["@type"] === "SoftwareApplication")?.inLanguage).toBe(lang);
+        expect(blocks.find((b) => b["@type"] === "BreadcrumbList")).toBeDefined();
+        expect(
+          (must(blocks.find((b) => b["@type"] === "FAQPage")).mainEntity as unknown[]).length,
+        ).toBeGreaterThanOrEqual(3);
+      }
+    }
+    for (const slug of ["security", "compare"] as const) {
+      expect(en).toContain(`href="/${slug}/"`);
+      expect(zh).toContain(`href="/zh/${slug}/"`);
+      expect(llms).toContain(`https://mingle.build/${slug}/`);
+      expect(llmsFull).toContain(`https://mingle.build/${slug}/`);
+      for (const [lang, ogLang, relPath, filePath] of [
+        ["en", "en", `/${slug}/`, join(out, slug, "index.html")],
+        ["zh-CN", "zh", `/zh/${slug}/`, join(out, "zh", slug, "index.html")],
+      ] as const) {
+        expect(sitemap).toContain(`<loc>https://mingle.build${relPath}</loc>`);
+        const html = readFileSync(filePath, "utf8");
+        expect(html).toContain(`<link rel="canonical" href="https://mingle.build${relPath}">`);
+        expect(html).toContain(`property="og:image" content="https://mingle.build/img/og/${slug}-${ogLang}.png"`);
+        const blocks = [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].map(
+          (m) => JSON.parse(must(m[1])) as Record<string, unknown>,
+        );
+        expect(blocks.find((b) => b["@type"] === "TechArticle")?.inLanguage).toBe(lang);
+        expect(blocks.find((b) => b["@type"] === "BreadcrumbList")).toBeDefined();
+        expect(
+          (must(blocks.find((b) => b["@type"] === "FAQPage")).mainEntity as unknown[]).length,
+        ).toBeGreaterThanOrEqual(3);
+      }
+    }
   });
 
   it("fails without --release instead of using package.json", async () => {

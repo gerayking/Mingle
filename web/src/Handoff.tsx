@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { type AgentView, api, HANDOFF_MAX_BYTES, type HandoffView } from "./api.ts";
 import { errorText, useI18n } from "./i18n.ts";
+import { onEscape } from "./shortcuts.ts";
 import {
   Button,
   CheckIcon,
@@ -72,7 +73,7 @@ export function HandoffSection({
 }) {
   const { t, locale } = useI18n();
   const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<"copy" | "paste">("copy");
+  const [mode, setMode] = useState<"copy" | "paste">(agent.remote ? "paste" : "copy");
   const recent = (handoffs ?? []).slice(0, RECENT);
   return (
     <Section title={t("handoff.title")}>
@@ -89,7 +90,8 @@ export function HandoffSection({
           )}
         </GroupRow>
         {open ? (
-          <div className="rise flex flex-col gap-4 px-4 py-4">
+          // biome-ignore lint/a11y/noStaticElementInteractions: Escape closes the panel it belongs to
+          <div className="rise flex flex-col gap-4 px-4 py-4" onKeyDown={onEscape(() => setOpen(false))}>
             <Segmented
               label={t("handoff.title")}
               value={mode}
@@ -99,6 +101,7 @@ export function HandoffSection({
                 { value: "paste", label: t("handoff.tabPaste") },
               ]}
             />
+            {agent.remote && mode === "copy" ? <p className="text-small text-ink2">{t("ssh.handoffHint")}</p> : null}
             {mode === "copy" ? (
               <CopyPrompt agent={agent} handoffs={handoffs} onClose={() => setOpen(false)} />
             ) : (
@@ -244,8 +247,36 @@ function PasteHandoff({ agent, onSent, onClose }: { agent: AgentView; onSent: ()
   const size = utf8.encode(text.trim()).byteLength;
   const over = size > HANDOFF_MAX_BYTES;
   const max = kilobytes(HANDOFF_MAX_BYTES);
+  const send = async () => {
+    setPending(true);
+    setResult(null);
+    try {
+      const { state } = await api.handoff(agent.id, text);
+      setText("");
+      setResult({
+        ok: true,
+        text:
+          state === "paused"
+            ? t("handoff.sentPaused", { name: agent.name })
+            : state === "busy"
+              ? t("handoff.sentBusy", { name: agent.name })
+              : t("handoff.sent", { name: agent.name }),
+      });
+      onSent();
+    } catch (error) {
+      setResult({ ok: false, text: errorText(t, error) });
+    } finally {
+      setPending(false);
+    }
+  };
   return (
-    <div className="flex flex-col gap-3">
+    <form
+      className="flex flex-col gap-3"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void send();
+      }}
+    >
       <p className="text-caption text-ink2">{t("handoff.pasteHint")}</p>
       <Textarea
         autoFocus
@@ -271,32 +302,7 @@ function PasteHandoff({ agent, onSent, onClose }: { agent: AgentView; onSent: ()
         <Button variant="ghost" disabled={pending} onClick={onClose}>
           {t("handoff.cancel")}
         </Button>
-        <Button
-          variant="primary"
-          disabled={pending || size === 0 || over}
-          onClick={async () => {
-            setPending(true);
-            setResult(null);
-            try {
-              const { state } = await api.handoff(agent.id, text);
-              setText("");
-              setResult({
-                ok: true,
-                text:
-                  state === "paused"
-                    ? t("handoff.sentPaused", { name: agent.name })
-                    : state === "busy"
-                      ? t("handoff.sentBusy", { name: agent.name })
-                      : t("handoff.sent", { name: agent.name }),
-              });
-              onSent();
-            } catch (error) {
-              setResult({ ok: false, text: errorText(t, error) });
-            } finally {
-              setPending(false);
-            }
-          }}
-        >
+        <Button type="submit" variant="primary" disabled={pending || size === 0 || over}>
           {t("handoff.send", { name: agent.name })}
         </Button>
       </div>
@@ -306,7 +312,7 @@ function PasteHandoff({ agent, onSent, onClose }: { agent: AgentView; onSent: ()
           {result.text}
         </p>
       ) : null}
-    </div>
+    </form>
   );
 }
 

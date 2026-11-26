@@ -19,6 +19,7 @@ import type {
   ReactionState,
   SendResult,
 } from "../channel.ts";
+import { type Mention, mentionSpots, renderMentions } from "../mention.ts";
 
 /**
  * DingTalk (钉钉): app created by scanning (device registration), messages over the
@@ -52,6 +53,8 @@ const CAPABILITIES: Capabilities = {
   fileUpload: true,
   fileDownload: true,
   listMembers: false,
+  // In groups, through the reply address of a recent message there (see sendBySession).
+  mentions: true,
   maxTextLength: 5000,
 };
 
@@ -68,6 +71,10 @@ export interface DingtalkMessage {
   isInAtList?: boolean;
   createAt?: number;
   robotCode?: string;
+  /** Where to reply to this message; unlike the robot send API it takes `at`. */
+  sessionWebhook?: string;
+  /** When `sessionWebhook` stops working, epoch milliseconds. */
+  sessionWebhookExpiredTime?: number;
   msgtype: string;
   text?: { content?: string };
   content?: {
@@ -153,10 +160,28 @@ export function dingtalkApi(fetchImpl: Fetch = fetch) {
     return body.media_id;
   }
 
+  /**
+   * Post to a message's reply address (`sessionWebhook`). Only DingTalk's own HTTPS hosts are
+   * accepted: the address comes from the inbound callback, and the access token goes with it.
+   */
+  async function sendBySession(c: { appKey: string; appSecret: string }, address: string, body: unknown) {
+    const url = trustedSessionWebhook(address);
+    if (!url) throw new Error("DingTalk reply address is not on dingtalk.com");
+    await json(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-acs-dingtalk-access-token": await token(c.appKey, c.appSecret),
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
   return {
     token,
     call,
     uploadMedia,
+    sendBySession,
     register: {
       async begin(signal?: AbortSignal) {
         const post = <T>(path: string, body: unknown) =>
@@ -293,6 +318,8 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
       const client = create({ clientId: keys.appKey, clientSecret: keys.appSecret });
       /** Per inbound message: the conversation it came from and who sent it. */
       const origins = new Map<string, { conversationId: string; staffId?: string; nick?: string }>();
+      /** Per group: the reply address of the latest message there, the only send that can @ people. */
+      const sessions = new Map<string, { address: string; until: number }>();
 
       client.registerCallbackListener(TOPIC_ROBOT, (event) => {
         try {
@@ -312,6 +339,19 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
           ...(message.senderNick ? { nick: message.senderNick } : {}),
         });
         if (origins.size > 2000) origins.delete(origins.keys().next().value as string);
+        if (
+          inbound.chat.kind === "group" &&
+          message.sessionWebhook &&
+          trustedSessionWebhook(message.sessionWebhook) &&
+          (message.sessionWebhookExpiredTime ?? 0) > Date.now()
+        ) {
+          sessions.delete(message.conversationId);
+          sessions.set(message.conversationId, {
+            address: message.sessionWebhook,
+            until: message.sessionWebhookExpiredTime as number,
+          });
+          if (sessions.size > 500) sessions.delete(sessions.keys().next().value as string);
+        }
         events.onMessage(inbound);
       });
       await client.connect();
@@ -334,8 +374,34 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
           });
         }
       };
+      const title = (text: string) => text.split("\n")[0]?.slice(0, 40) || "Mingle";
       const sendMarkdown = (chat: ChatRef, text: string) =>
-        sendRobot(chat, "sampleMarkdown", { title: text.split("\n")[0]?.slice(0, 40) || "Mingle", text });
+        sendRobot(chat, "sampleMarkdown", { title: title(text), text });
+      /**
+       * The robot send API has no `at`, so a group message that @-mentions people goes through the
+       * reply address of a recent message in that group: `@<staffId>` in the text plus `at.atUserIds`
+       * is what DingTalk turns into a mention that notifies. False when there is no usable address.
+       */
+      const sendMentioning = async (chat: ChatRef, text: string, mentions: readonly Mention[]): Promise<boolean> => {
+        const session = sessions.get(chat.platformId);
+        if (!session || session.until < Date.now() + 30_000) return false;
+        const ids = [...new Set(mentionSpots(text, mentions).map((s) => s.mention.id))];
+        const body = renderMentions(text, mentions, (m) => `@${m.id}`);
+        try {
+          await api.sendBySession(keys, session.address, {
+            msgtype: "markdown",
+            markdown: { title: title(text), text: body },
+            at: { atUserIds: ids, isAtAll: false },
+          });
+          return true;
+        } catch (error) {
+          // DingTalk answered and turned it down (expired, revoked): nothing went out, send it plainly.
+          // Without an answer it may have gone out; let the caller report that rather than send it twice.
+          if ((error as { status?: number }).status === undefined) throw error;
+          sessions.delete(chat.platformId);
+          return false;
+        }
+      };
       /** Each file is its own message: an inline image where DingTalk can show one, otherwise a file. */
       const sendFile = async (chat: ChatRef, file: { path: string; name?: string }): Promise<boolean> => {
         const { size } = await stat(file.path);
@@ -380,7 +446,14 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
           let sentAny = false;
           try {
             if (message.text) {
-              await sendMarkdown(message.chat, message.text);
+              const mentioning =
+                message.chat.kind !== "dm" &&
+                message.mentions?.length &&
+                mentionSpots(message.text, message.mentions).length > 0;
+              if (!mentioning || !(await sendMentioning(message.chat, message.text, message.mentions ?? []))) {
+                await sendMarkdown(message.chat, message.text);
+                if (mentioning) degraded.push("mentions_plain");
+              }
               sentAny = true;
             }
             for (const file of message.files ?? []) {
@@ -418,7 +491,8 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
           const withMention = (text: string) =>
             atUserIds
               ? `${Object.entries(atUserIds)
-                  .map(([id, nick]) => `<a atId="${id}">@${nick}</a>`)
+                  // DingTalk draws the `@` of an atId link itself; writing one here showed `@@nick`.
+                  .map(([id, nick]) => `<a atId="${escapeHtml(id)}">${escapeHtml(nick)}</a>`)
                   .join(" ")} ${text}`
               : text;
           const data = (text: string, flowStatus: string) => ({
@@ -461,9 +535,13 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
             update: async (markdown) => {
               await stream(markdown, false).catch(() => {});
             },
-            finish: async (markdown) => {
+            finish: async (markdown, mentions) => {
               try {
                 const text = withMention(markdown);
+                // A card can only @ whom it was delivered to (the asker); anyone else stays plain text.
+                const others = mentionSpots(markdown, mentions ?? []).some(
+                  (spot) => !atUserIds || !(spot.mention.id in atUserIds),
+                );
                 await stream(text, true);
                 await api.call(
                   keys,
@@ -471,7 +549,7 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
                   { outTrackId, cardData: data(text, "3"), cardUpdateOptions: { updateCardDataByKey: true } },
                   "PUT",
                 );
-                return { kind: "sent", platformId: outTrackId };
+                return { kind: "sent", platformId: outTrackId, ...(others ? { degraded: ["mentions_plain"] } : {}) };
               } catch {
                 return { kind: "failed", code: "unknown", retryable: false };
               }
@@ -502,6 +580,22 @@ export function dingtalkChannel(options: DingtalkOptions = {}): Channel {
       };
     },
   };
+}
+
+/** A `sessionWebhook` from a callback, if it points at DingTalk over HTTPS. */
+function trustedSessionWebhook(address: string): string | undefined {
+  try {
+    const url = new URL(address);
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return undefined;
+    if (url.hostname !== "dingtalk.com" && !url.hostname.endsWith(".dingtalk.com")) return undefined;
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
 /** Map a DingTalk robot callback to Mingle's shape. Exported for tests. */

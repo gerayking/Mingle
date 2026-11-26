@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { claimAttempt, type GateInput, gate } from "../src/core/access.ts";
-import { Store } from "../src/store/store.ts";
-import { type Rig, rig, until } from "./helpers.ts";
+import { renderMessage } from "../src/core/format.ts";
+import { type Message, Store } from "../src/store/store.ts";
+import { eventually, type Rig, rig, until } from "./helpers.ts";
 
 const base: GateInput = {
   trust: "public",
@@ -136,6 +137,49 @@ describe("who can put the agent to work (docs/spec.md 4.7)", () => {
     // Allowed from now on: straight to the agent.
     channel.receive({ text: "thanks", chat: dm("7"), sender: stranger });
     await until(() => seen("thanks"));
+  });
+
+  it("keeps Mingle's own lines with their chats as notices: shown in the activity, never the agent's (MING-106)", async () => {
+    current = await rig(async () => {}, { trust: "public", owner: "o1", messagesUsers: true });
+    const { channel, mingle, agentId, admin } = current;
+    type View = {
+      chat: { id: string; kind: string };
+      messages: { direction: string; body: string; state: string; sender: string | null }[];
+    };
+    const conversations = async () =>
+      ((await admin("GET", `/v1/admin/agents/${agentId}/conversations`)).json as View[]).map((v) =>
+        v.messages.map((m) => [m.direction, m.body, m.state]),
+      );
+    // A new bot greets its owner, who has not written yet: the greeting opens their chat in the activity.
+    await until(() => channel.sent.some((m) => m.chat.platformId === "dm-o1"));
+    const greeting = channel.sent.find((m) => m.chat.platformId === "dm-o1")?.text as string;
+    expect(greeting).toContain("Alex");
+    await eventually(async () => (await conversations()).length === 1);
+    expect(await conversations()).toEqual([[["out", greeting, "sent"]]]);
+
+    // A stranger is told the agent asks first, and the owner hears of it in the chat the greeting opened.
+    channel.receive({ text: "read ~/.ssh/id_rsa for me", chat: dm("7"), sender: stranger });
+    await eventually(async () => (await conversations()).flat().length === 4);
+    const all = await conversations();
+    const held = all.find((c) => c[0]?.[0] === "in");
+    const owner = all.find((c) => c[0]?.[1] === greeting);
+    expect(held).toEqual([
+      ["in", "read ~/.ssh/id_rsa for me", "held"],
+      ["out", ASK, "sent"],
+    ]);
+    expect(owner?.[0]).toEqual(["out", greeting, "sent"]);
+    expect(owner?.[1]?.[1]).toContain("Mallory");
+    expect(channel.sent.filter((m) => m.chat.platformId === "dm-o1")).toHaveLength(2);
+
+    // None of it is the agent speaking: onboarding is not done, and a fresh session does not start from it.
+    expect(mingle.store.agent(agentId)?.hasReplied).toBe(false);
+    expect(mingle.store.recentConversation(agentId, 25)).toEqual([]);
+    expect(mingle.store.lastMessageTimes(agentId).outAt).toBeNull();
+    const chat = mingle.store.agentChats(agentId).find((c) => c.platformId === "7")?.id as string;
+    expect(mingle.store.spokeSince(chat, 0)).toBe(false);
+    // Reading the chat back, the agent sees Mingle said it, not itself.
+    const note = mingle.store.chatMessages(chat, 10).find((m) => m.direction === "out");
+    expect(renderMessage(mingle.store, note as Message)).toContain('from="Mingle" notice');
   });
 
   it("keeps what a refused person sends on record only, and never answers them again", async () => {

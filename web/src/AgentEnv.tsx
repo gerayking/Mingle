@@ -2,6 +2,7 @@ import { type FormEvent, useState } from "react";
 import { type AgentView, api, type EnvVar, type Harness } from "./api.ts";
 import { useCached } from "./cache.ts";
 import { errorText, useI18n } from "./i18n.ts";
+import { onEscape } from "./shortcuts.ts";
 import {
   AlertIcon,
   Button,
@@ -171,7 +172,13 @@ function EnvRow({
         {variable.name}
       </span>
       {confirming ? (
-        <span className="flex shrink-0 items-center gap-1.5">
+        // biome-ignore lint/a11y/noStaticElementInteractions: Escape backs out of the question it belongs to
+        <span
+          className="flex shrink-0 items-center gap-1.5"
+          onKeyDown={onEscape(() => {
+            if (!busy) onCancelDelete();
+          })}
+        >
           <span className="sr-only">{t("env.deleteAsk", { name: variable.name })}</span>
           <Button
             small
@@ -185,7 +192,7 @@ function EnvRow({
           >
             {t("env.delete")}
           </Button>
-          <Button small variant="ghost" onClick={onCancelDelete}>
+          <Button small variant="ghost" autoFocus disabled={busy} onClick={onCancelDelete}>
             {t("agent.cancel")}
           </Button>
         </span>

@@ -8,6 +8,10 @@
  * - An adapter never throws for "the platform cannot do this": it degrades and says so.
  */
 
+import type { Mention } from "./mention.ts";
+
+export type { Mention } from "./mention.ts";
+
 export type Platform =
   | "wechat"
   | "wecom"
@@ -18,7 +22,9 @@ export type Platform =
   | "discord"
   | "telegram"
   | "imessage"
-  | "github";
+  | "github"
+  /** The owner's private chat in the Mingle console (docs/spec.md 6.9). Built in, not a chat app. */
+  | "local";
 
 export type ChatKind = "dm" | "group" | "thread";
 
@@ -39,6 +45,17 @@ export interface Capabilities {
   readonly fileUpload: boolean;
   readonly fileDownload: boolean;
   readonly listMembers: boolean;
+  /**
+   * Turns `@name` into a real mention, from `OutboundMessage.mentions` (docs/spec.md 4.2). Absent:
+   * the name goes out as plain text, which notifies nobody and wakes no bot.
+   */
+  readonly mentions?: true;
+  /**
+   * Can open a thread under a message by replying into it (`OutboundMessage.inThread`): a Feishu
+   * "reply in thread", a Discord thread started from a message (docs/spec.md 4.13). Absent: such a
+   * reply goes out as a plain quoted reply, as before.
+   */
+  readonly threads?: true;
   /** Largest text body one message can carry; longer bodies are split by the core. */
   readonly maxTextLength: number;
 }
@@ -129,6 +146,11 @@ export interface OnboardingContext {
    * rebinds the existing connection.
    */
   readonly reauthorize?: Credentials;
+  /**
+   * Optional permissions the owner turned on for this re-authorization (docs/spec.md 6.1). The app
+   * asks for them on top of what it always asks for, and keeps those it was already granted.
+   */
+  readonly adding?: readonly PermissionId[];
 }
 
 export type OnboardingFailure =
@@ -182,6 +204,12 @@ export interface ChatRef {
    * that were not addressed to the bot. The agent reads them there (docs/spec.md 4.2).
    */
   readonly parent?: { readonly platformId: string; readonly name?: string };
+  /**
+   * A thread that is one conversation (a Discord thread), not a lasting place of its own (a Telegram
+   * forum topic, a GitHub issue): once the agent has spoken in it, what people say there next is
+   * addressed to it, as in a conversation, without an @ each time (docs/spec.md 4.2).
+   */
+  readonly followUp?: true;
 }
 
 export interface Sender {
@@ -216,6 +244,11 @@ export interface InboundMessage {
    * message addressed to the bot as a mention.
    */
   readonly mentioned?: boolean;
+  /**
+   * The others the text @-mentions, as the platform reports them. The core adds them to the address
+   * book, so the agent can mention them back by name, other bots included.
+   */
+  readonly mentions?: readonly Sender[];
   readonly sentAt: number;
   /**
    * Read from the chat's history when the bot joined, not delivered as it was sent. The core keeps
@@ -231,10 +264,40 @@ export interface OutboundMessage {
   /** Platform id of the message to quote. Ignored, and reported, where unsupported. */
   readonly replyTo?: string;
   readonly files?: readonly { readonly path: string; readonly name?: string }[];
+  /**
+   * People the text @-mentions by name. Where `Capabilities.mentions`, the adapter writes each spot
+   * `mentionSpots` finds as a real mention; elsewhere the text goes out as written.
+   */
+  readonly mentions?: readonly Mention[];
+  /**
+   * Reply to `replyTo` in a thread under it, opening one if it has none (where `Capabilities.threads`).
+   * `title` names the thread where the platform names threads. The result's `thread` is where the
+   * reply landed. Where a thread cannot be opened after all, it goes out as a quoted reply and
+   * reports `thread_dropped`.
+   */
+  readonly inThread?: { readonly title: string };
+  /**
+   * This reply is an outcome the whole chat should see, not only those following a thread under
+   * `replyTo` (a line's result, docs/spec.md 4.13). Where a reply to `replyTo` would land in its
+   * thread (Feishu, once one is open under it), it goes out as a message of its own in the chat;
+   * where a thread reply can also show in the channel (Slack), it does both. Elsewhere ignored.
+   */
+  readonly inChat?: true;
 }
 
 export type SendResult =
-  | { readonly kind: "sent"; readonly platformId: string; readonly degraded?: readonly Degradation[] }
+  | {
+      readonly kind: "sent";
+      readonly platformId: string;
+      readonly degraded?: readonly Degradation[];
+      /**
+       * The chat's own ID, when it was addressed another way: a direct chat opened by the person's
+       * ID (`openDirect`) on a platform that names the chat only once a message is in it.
+       */
+      readonly chat?: string;
+      /** The thread the message went into, when it opened one (`OutboundMessage.inThread`). */
+      readonly thread?: ChatRef;
+    }
   /** The platform refused. `retryable` says whether trying again can help. */
   | {
       readonly kind: "failed";
@@ -256,7 +319,15 @@ export function withTextSent(result: SendResult, textPlatformId: string): SendRe
   return textPlatformId && result.kind === "failed" ? { ...result, textSent: { platformId: textPlatformId } } : result;
 }
 
-export type Degradation = "quote_dropped" | "files_dropped" | "markdown_flattened" | "text_split";
+export type Degradation =
+  | "quote_dropped"
+  | "files_dropped"
+  | "markdown_flattened"
+  | "text_split"
+  /** Asked for a thread (`OutboundMessage.inThread`), sent as a quoted reply: none could be opened. */
+  | "thread_dropped"
+  /** `@name`s went out as plain text: the chat app has no mention a bot can write. */
+  | "mentions_plain";
 
 // ------------------------------------------------------------------- adapter
 
@@ -279,10 +350,16 @@ export interface LiveOptions {
 }
 
 export interface LiveReply {
+  /**
+   * When the platform stops taking updates to this reply, if it does (WeCom's stream window).
+   * Before then Mingle closes it with a note and sends the answer as a message of its own, so
+   * the reply does not stay frozen on its last progress.
+   */
+  readonly until?: number;
   /** Replace the progress content. Markdown. Best effort. */
   update(markdown: string): Promise<void>;
-  /** Replace the content with the final answer and close the reply. */
-  finish(markdown: string): Promise<SendResult>;
+  /** Replace the content with the final answer and close the reply. `mentions` as in `OutboundMessage`. */
+  finish(markdown: string, mentions?: readonly Mention[]): Promise<SendResult>;
 }
 
 /** One adapter instance per platform. Stateless across bots. */
@@ -303,12 +380,24 @@ export interface Channel {
   readonly reauthorize?: boolean;
   /** Where the owner adds a connected bot to a server or group, for platforms where that is a separate step. */
   inviteUrl?(bot: BotIdentity): string;
+  /**
+   * Its bots can be sent every message in their groups, not only those that @ them (where the
+   * platform asks for one, given the `group_messages` permission), so a group can be set to hear
+   * everything (docs/spec.md 4.2). Absent where the platform only delivers what @s the bot.
+   */
+  readonly groupMessages?: true;
   /** Who can reach its bots. Absent means `public`: the safe side for a platform not described here. */
   readonly trust?: Trust;
   /** False where nobody can message the bot directly (GitHub), so nobody claims it that way. */
   readonly directMessages?: false;
   /** A link that opens a direct chat with the bot with `/start <code>` ready to send (Telegram). */
   claimUrl?(bot: BotIdentity, code: string): string;
+  /**
+   * Built into Mingle rather than a chat app (the console's private chat, docs/spec.md 6.9): every
+   * agent has exactly one such connection, made by Mingle, with no credentials, no onboarding and
+   * no owner to claim. It is not listed among the agent's chat apps.
+   */
+  readonly builtin?: true;
 
   /** Start connecting a new bot. Yields progress until `succeeded` or `failed`. */
   onboard(
@@ -343,14 +432,31 @@ export interface ChannelConnection {
   setTyping(chat: ChatRef, typing: boolean): Promise<void>;
 
   download(attachment: InboundAttachment, toPath: string): Promise<void>;
-  /** Open a direct conversation with a user by sending the first message. Where the platform allows it. */
-  messageUser?(userId: string, text: string): Promise<void>;
+  /**
+   * Open a direct conversation with a user by sending the first message. Where the platform allows it.
+   * Reports the direct chat's ID, as its incoming messages name it, and the sent message's ID, so
+   * Mingle can keep the line with the chat; `undefined` when the platform does not say.
+   */
+  messageUser?(userId: string, text: string): Promise<{ chat: string; platformId?: string } | undefined>;
+  /**
+   * The ID to send to for a direct chat with this user, when they have not messaged the bot yet
+   * (docs/spec.md 5.3). Absent where the platform lets a bot write only to people who wrote first;
+   * throws when the platform refuses this user. A platform that names the chat only once a message
+   * is in it may return the user's ID, and reports the chat's own ID on the first send (`chat`).
+   */
+  openDirect?(userId: string): Promise<string>;
   listMembers(chat: ChatRef): Promise<readonly Sender[]>;
   /**
    * Permissions the owner can grant this bot on the platform, read live (docs/spec.md 4.2). Absent
    * where the platform has none to grant. Best effort; never throws, leaves out what it cannot tell.
    */
   permissions?(): Promise<readonly BotPermission[]>;
+  /**
+   * Where this person sits in the organization, in one line ("Product · Product manager"), where
+   * the platform says and the owner turned member profiles on. Undefined when it cannot tell.
+   * Best effort; never throws.
+   */
+  profile?(userId: string): Promise<string | undefined>;
 
   close(): Promise<void>;
 }
@@ -359,10 +465,23 @@ export interface ChannelConnection {
  * A permission the owner grants a bot on the platform itself.
  * `group_messages`: every message in the bot's groups, not only the ones that @ it; on Feishu also
  * the group's earlier messages.
+ * `bot_messages`: what other bots send in the bot's groups. Feishu only; other platforms do not
+ * report it.
+ * `doc_comments`: comments in documents shared with the bot, so people can @ it there and it answers
+ * in the comment thread (Feishu, docs/spec.md 6.8).
+ * `member_profiles`: the department and title of the people the bot meets, so the agent knows who
+ * is who in the organization (Feishu).
  */
+export type PermissionId = "group_messages" | "bot_messages" | "doc_comments" | "member_profiles";
+
 export interface BotPermission {
-  readonly id: "group_messages";
+  readonly id: PermissionId;
   readonly granted: boolean;
+  /**
+   * Not asked for when the bot is created: the owner turns it on later from the bot's settings,
+   * which keeps connecting simple (docs/spec.md 6.1).
+   */
+  readonly optional?: boolean;
   /**
    * How the owner grants it on the platform's site. Absent where it cannot be granted there, or
    * where the console grants it itself (`Channel.reauthorize`). `url` opens the platform's page with the change prefilled where the

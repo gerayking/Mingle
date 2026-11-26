@@ -136,7 +136,7 @@ describe("log", () => {
   it("asks a running Mingle what the log calls the agent, its connections included", async () => {
     current = await rig(async () => {});
     const { mingle, agentId, home, url } = current;
-    const connection = mingle.store.connections(agentId)[0]?.id as string;
+    const connection = mingle.store.connections(agentId).filter((n) => n.platform !== "local")[0]?.id as string;
     writeFileSync(join(home, "runtime.json"), JSON.stringify({ url, adminToken: mingle.adminToken }));
     writeFileSync(
       join(home, "logs", "mingle.log"),

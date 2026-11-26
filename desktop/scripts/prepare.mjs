@@ -60,6 +60,8 @@ cpSync(join(root, "dist"), join(base, "dist"), { recursive: true });
 for (const file of ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "LICENSE"]) {
   cpSync(join(root, file), join(base, file));
 }
+const patches = join(root, "patches");
+if (existsSync(patches)) cpSync(patches, join(base, "patches"), { recursive: true });
 run(
   "pnpm",
   ["install", "--prod", "--frozen-lockfile", "--ignore-scripts", "--config.node-linker=hoisted", "--silent"],
@@ -67,6 +69,7 @@ run(
 );
 rmSync(join(base, "pnpm-lock.yaml"));
 rmSync(join(base, "pnpm-workspace.yaml"));
+rmSync(join(base, "patches"), { recursive: true, force: true });
 
 for (const system of systems) {
   // Not "mingle": on Linux the app's executable has that name, in the same directory.

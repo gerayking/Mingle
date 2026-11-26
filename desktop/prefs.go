@@ -23,6 +23,8 @@ type prefs struct {
 	CloseHintShown bool `json:"closeHintShown,omitempty"`
 	// OnlineCardDismissed hides the console's "keep your agents online" card.
 	OnlineCardDismissed bool `json:"onlineCardDismissed,omitempty"`
+	// WebCachesVersion is the app version whose first run cleared the window's web caches.
+	WebCachesVersion string `json:"webCachesVersion,omitempty"`
 }
 
 var (

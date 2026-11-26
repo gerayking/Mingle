@@ -13,4 +13,6 @@ export const harnesses = [
   ["dsh", "DeepSeek Harness"],
   ["pi", "Pi"],
   ["antigravity", "Antigravity"],
+  ["devin", "Devin"],
+  ["factory", "Factory Droid"],
 ];

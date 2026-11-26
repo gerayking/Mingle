@@ -5,11 +5,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { envRef } from "../src/core/env.ts";
 import { renderManual } from "../src/core/manual.ts";
 import { memorySecrets, type SecretStore } from "../src/platform/secrets.ts";
-import { messageIds, type Rig, rig, runCli, until } from "./helpers.ts";
+import { messageIds, type Rig, rig, runCli, runCliNode, until } from "./helpers.ts";
 
 /** An agent's own environment variables (docs/spec.md 3, 4.4). */
 
 const SECRET = "https://hooks.example.test/T000/s3cr3t-value";
+
+// Two subprocesses run before the reply below, which is slow on loaded Windows runners.
+const CHILD_REPLY_TIMEOUT_MS = 20_000;
 
 let current: Rig | undefined;
 afterEach(async () => {
@@ -17,26 +20,29 @@ afterEach(async () => {
   current = undefined;
 });
 
-/** Print a variable from a shell with the session's environment, as the agent's commands do. */
-const readInShell = (env: Record<string, string>, name: string) =>
+/** Print a variable from a child process with the session's environment, as the agent's commands do. */
+const readInChild = (env: Record<string, string>, name: string) =>
   new Promise<string>((resolve, reject) => {
     const [file, args] =
       process.platform === "win32"
-        ? ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `[Console]::Out.Write($env:${name})`]]
+        ? [process.execPath, ["-e", 'process.stdout.write(process.env[process.argv[1]] ?? "")', name]]
         : ["sh", ["-c", `printf '%s' "$${name}"`]];
     execFile(file as string, args as string[], { env: { ...process.env, ...env } }, (error, stdout) =>
       error ? reject(error) : resolve(stdout.replace(/\r\n/g, "\n")),
     );
   });
 
-/** A rig whose agent answers every message with what its shell prints for `$NAME`. */
+/** A rig whose agent answers every message with what a child command prints for `$NAME`. */
 async function echoing(name: string, extra: Parameters<typeof rig>[1] = {}) {
   const seen: ScriptedTurn["options"][] = [];
   const r = await rig(async (t) => {
     seen.push(t.options);
     const env = t.options.env as Record<string, string>;
-    const value = await readInShell(env, name);
-    for (const id of messageIds(t.input)) await runCli(env, ["message", "reply", id], value || "(unset)");
+    const value = await readInChild(env, name);
+    for (const id of messageIds(t.input)) {
+      const reply = await runCliNode(env, ["message", "reply", id], value || "(unset)");
+      if (reply.code !== 0) throw new Error("reply CLI failed");
+    }
   }, extra);
   return { r, seen };
 }
@@ -130,13 +136,13 @@ describe("agent env API", () => {
 });
 
 describe("agent env in the session", () => {
-  it("reaches the agent's shell: echo $FOO prints the value", async () => {
+  it("reaches the agent's commands: a child process prints the value", async () => {
     const lines: string[] = [];
     const { r, seen } = await echoing("FOO", { log: (line) => lines.push(line) });
     current = r;
     await r.admin("PUT", `/v1/admin/agents/${r.agentId}/env/FOO`, { value: SECRET });
     r.channel.receive({ text: "what is FOO?" });
-    expect((await until(() => r.channel.sent[0])).text).toBe(SECRET);
+    expect((await until(() => r.channel.sent[0], CHILD_REPLY_TIMEOUT_MS)).text).toBe(SECRET);
 
     const options = seen.at(-1);
     // The guide names the variable and never carries its value.
@@ -155,7 +161,7 @@ describe("agent env in the session", () => {
     await secrets.set(envRef(r.agentId, "MINGLE_TOKEN"), JSON.stringify("hijacked"));
     await r.mingle.runtime(r.agentId)?.restart();
     r.channel.receive({ text: "hi" });
-    await until(() => r.channel.sent[0]); // the CLI still authenticates
+    await until(() => r.channel.sent[0], CHILD_REPLY_TIMEOUT_MS); // the CLI still authenticates
     expect(seen.at(-1)?.env?.MINGLE_TOKEN).not.toBe("hijacked");
     expect(r.channel.sent[0]?.text).not.toBe("hijacked");
   });
@@ -166,7 +172,7 @@ describe("agent env in the session", () => {
     const pem = "-----BEGIN KEY-----\nabc\ndef\n-----END KEY-----";
     await r.admin("PUT", `/v1/admin/agents/${r.agentId}/env/PEM`, { value: pem });
     r.channel.receive({ text: "pem?" });
-    expect((await until(() => r.channel.sent[0])).text).toBe(pem);
+    expect((await until(() => r.channel.sent[0], CHILD_REPLY_TIMEOUT_MS)).text).toBe(pem);
   });
 
   it("applies a change from the next message, without cutting the current turn short", async () => {

@@ -11,6 +11,8 @@ import {
   type CursorSdk,
   createCursorRuntime,
   defaultRuntimes,
+  type ExecutableInstallation,
+  type InstallationSnapshot,
   type Runtime,
   RuntimeFailureError,
   runtimeBrandIcon,
@@ -102,6 +104,13 @@ export interface TurnEnd {
   readonly failure?: Failure;
   /** For `quota`: when the limit resets (epoch ms), where the harness reports it. */
   readonly resetsAt?: number;
+  /**
+   * A prompted turn that completed with no reasoning, text or tool call: the harness acknowledged
+   * the input without running the model on it. Kimi Code does this while a turn it began itself
+   * (a background task finishing) is running: the prompt is queued natively and answered at once,
+   * and the model only sees it when that turn ends (earayu/Mingle#125).
+   */
+  readonly empty?: boolean;
 }
 
 export interface HarnessEvents {
@@ -117,6 +126,11 @@ export interface HarnessEvents {
   onAction?(tool: string, input?: string): void;
   /** What the turn that just ended cost, once the harness reports it. */
   onTurnUsage?(usage: TurnUsage): void;
+  /**
+   * The harness reported anything at all: the session is alive, whatever the event. Subagent
+   * work and background tasks count too, though they show no activity of their own.
+   */
+  onProgress?(): void;
 }
 
 /** Tokens one turn used, every model call in it together. */
@@ -137,6 +151,11 @@ export interface HarnessSession {
   deliver(text: string, inputId: string): Promise<{ outcome: DeliverOutcome; reason?: string }>;
   /** Tokens in the session's context as the harness last reported it; null before it has. */
   contextTokens?(): number | null;
+  /**
+   * Background tasks (commands, subagents) the session started and still runs. Claude Code begins a
+   * turn of its own when one ends, so the session must stay open until then.
+   */
+  background?(): number;
   /**
    * Stop the agent's work: the running turn, and the background tasks (commands, subagents) it
    * left running, where the harness can stop one task (Claude Code, Codex, Qoder). True when
@@ -273,6 +292,8 @@ const ORDER = [
   "dsh",
   "pi",
   "antigravity",
+  "devin",
+  "factory",
 ];
 
 export interface RuntimeSource {
@@ -300,6 +321,39 @@ function incompatibility(runtime: Runtime, install: AvailableInstallation): Harn
     }
   }
   return undefined;
+}
+
+/**
+ * Resume `id`, or open a fresh session when the saved one cannot come back. A refusal at resume
+ * is about that saved session, not about the harness: a harness that refuses to resume one
+ * conversation (Pi with unregistered pending tools, DSH with a session saved elsewhere) still
+ * opens new ones, and retrying the same resume would fail on every message forever. Grok refuses
+ * an appended prompt on every resume, keeping the one saved with the session: resume without it.
+ */
+async function resumeOrReplace(
+  runtime: Runtime,
+  install: AvailableInstallation,
+  base: Parameters<Runtime["session"]>[1],
+  id: string,
+): Promise<{ session: Session; resumed: boolean; keptGuide: boolean }> {
+  try {
+    return { session: await runtime.session(install, { ...base, resume: id }), resumed: true, keptGuide: false };
+  } catch (error) {
+    if (error instanceof UnsupportedOptionError && error.option === "appendSystemPrompt" && base.appendSystemPrompt) {
+      const { appendSystemPrompt: _, ...rest } = base;
+      try {
+        return { session: await runtime.session(install, { ...rest, resume: id }), resumed: true, keptGuide: true };
+      } catch (retry) {
+        if (!replaceable(retry)) throw retry;
+      }
+    } else if (!replaceable(error)) throw error;
+  }
+  return { session: await runtime.session(install, base), resumed: false, keptGuide: false };
+}
+
+/** The saved session is gone, or the harness will not resume it as asked: a new one takes its place. */
+function replaceable(error: unknown): boolean {
+  return error instanceof UnsupportedOptionError || (error as Error).name === "SessionNotFoundError";
 }
 
 function requireCompatible(runtime: Runtime, install: AvailableInstallation): void {
@@ -407,8 +461,38 @@ function inlineEnvNote(env: Readonly<Record<string, string>>): string {
 }
 
 export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { vendorDir?: string } = {}): Harness {
+  /**
+   * Where each harness was last found. A probe can miss a harness that is there: its readiness
+   * check (`codebuddy --help`) or the npm lookup behind it runs out of time while every harness
+   * starts at once, which on Windows (a .cmd shim, Node, an antivirus scan) can take seconds. One
+   * miss would flip the harness between installed and not from one look to the next. So a probe
+   * that finds nothing, or does not answer, keeps the last copy while its executable is still on
+   * disk. A harness that ran and refused (`unsupported`), or whose file is gone, is believed.
+   */
+  const lastFound = new Map<string, ExecutableInstallation>();
+
+  async function probe(runtime: Runtime): Promise<InstallationSnapshot | undefined> {
+    let found: InstallationSnapshot | undefined;
+    let failure: unknown;
+    try {
+      found = await runtime.installation?.();
+    } catch (error) {
+      failure = error;
+    }
+    if (found?.kind === "available") {
+      if (found.via === "executable") lastFound.set(runtime.id, found);
+      else lastFound.delete(runtime.id);
+      return found;
+    }
+    const last = lastFound.get(runtime.id);
+    if (found?.kind !== "unsupported" && last && existsSync(last.command)) return last;
+    lastFound.delete(runtime.id);
+    if (failure !== undefined) throw failure;
+    return found;
+  }
+
   async function installation(runtime: Runtime): Promise<AvailableInstallation> {
-    const found = await runtime.installation?.();
+    const found = await probe(runtime);
     if (found?.kind !== "available") {
       throw new HarnessError("not_installed", `${runtime.id} is not installed on this computer`);
     }
@@ -453,30 +537,41 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
   /** The newest version each harness's updater last named: what an update offered goes to. */
   const latest = new Map<string, string>();
 
+  /** Every harness's state. Each probe starts the harness's executable; run them side by side. */
+  const look = (): Promise<HarnessStatus[]> =>
+    Promise.all(
+      ids().map(async (id): Promise<HarnessStatus> => {
+        const runtime = lookup(id);
+        const found = await probe(runtime).catch(() => undefined);
+        const available = found?.kind === "available" ? found : undefined;
+        const disabled = available ? incompatibility(runtime, available) : undefined;
+        return {
+          ...info(id, runtime, available),
+          ...(disabled ? { disabled } : {}),
+          installed: Boolean(available),
+          ...(found?.kind === "unsupported" ? { unsupported: found.reason } : {}),
+          canInstall: Boolean(runtime.install),
+          canSignIn: Boolean(runtime.login),
+          canUpdate: Boolean(runtime.checkUpdate && runtime.upgrade),
+        };
+      }),
+    );
+  let looking: Promise<HarnessStatus[]> | undefined;
+
   return {
     async available() {
       return (await this.catalog?.())?.filter((h) => h.installed) ?? [];
     },
 
-    async catalog() {
-      // Each probe starts the harness's executable for its version; run them side by side.
-      return Promise.all(
-        ids().map(async (id): Promise<HarnessStatus> => {
-          const runtime = lookup(id);
-          const found = await runtime.installation?.().catch(() => undefined);
-          const available = found?.kind === "available" ? found : undefined;
-          const disabled = available ? incompatibility(runtime, available) : undefined;
-          return {
-            ...info(id, runtime, available),
-            ...(disabled ? { disabled } : {}),
-            installed: Boolean(available),
-            ...(found?.kind === "unsupported" ? { unsupported: found.reason } : {}),
-            canInstall: Boolean(runtime.install),
-            canSignIn: Boolean(runtime.login),
-            canUpdate: Boolean(runtime.checkUpdate && runtime.upgrade),
-          };
-        }),
-      );
+    catalog() {
+      // `available` and `catalog` are often asked together; share one look instead of starting
+      // every harness twice at once, which is what makes a slow one miss its deadline.
+      if (looking) return looking;
+      const current: Promise<HarnessStatus[]> = look().finally(() => {
+        if (looking === current) looking = undefined;
+      });
+      looking = current;
+      return current;
     },
 
     async signInState(id) {
@@ -542,6 +637,8 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
         timeoutMs: 10 * 60_000,
         ...(runtime.installLines?.length ? { line: runtime.installLines[0]?.line as string } : {}),
       });
+      // A look started before the install must not answer for after it.
+      looking = undefined;
       if (result.kind === "installed" || result.kind === "already_installed") return { ok: true };
       if (result.kind === "failed") return { ok: false, detail: result.output.trim().split("\n").slice(-6).join("\n") };
       return { ok: false, detail: result.detail ?? result.reason };
@@ -564,6 +661,7 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
       const runtime = lookup(id);
       if (!runtime.upgrade) return { ok: false, detail: "no updater" };
       const result = await runtime.upgrade(await installation(runtime), { timeoutMs: 10 * 60_000 });
+      looking = undefined;
       const tail = (output: string) => output.trim().split("\n").slice(-6).join("\n");
       if (result.kind === "upgraded" || result.kind === "current") return { ok: true };
       // Updaters can exit 0 without touching this copy; the version it reports decides. A copy
@@ -668,25 +766,25 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
       };
       let session: Session;
       let resumed = false;
+      /** The resumed session keeps the guide it was opened with: none is appended this time. */
+      let keptGuide = false;
       try {
         if (options.resume) {
-          try {
-            session = await runtime.session(install, { ...base, resume: options.resume });
-            resumed = true;
-          } catch (error) {
-            if ((error as Error).name !== "SessionNotFoundError") throw error;
-            session = await runtime.session(install, base);
-          }
+          const opened = await resumeOrReplace(runtime, install, base, options.resume);
+          session = opened.session;
+          resumed = opened.resumed;
+          keptGuide = opened.keptGuide;
         } else {
           session = await runtime.session(install, base);
         }
       } catch (error) {
         // A refusal the declarations did not cover (like OpenCode's version split):
-        // report it as incompatibility, not as a raw harness error.
+        // report it as incompatibility, not as a raw harness error. The harness's own reason
+        // goes into the message so the log says which setting it refused.
         if (error instanceof UnsupportedOptionError) {
           throw new MingleError(
             "harness_incompatible",
-            "This harness cannot apply the settings Mingle needs. Choose another harness.",
+            `This harness cannot apply the settings Mingle needs (${error.option}: ${error.message}). Choose another harness.`,
           );
         }
         throw error;
@@ -694,6 +792,10 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
 
       /** A turn is running: one Mingle prompted, or one the harness began itself. */
       let turn: "prompted" | "self" | undefined;
+      /** The open turn showed the model working: reasoning, text or a tool call. */
+      let worked = false;
+      /** Mingle itself closed the session: its exit event is expected, not a crash. */
+      let disposed = false;
       /** Tasks running beside the turns, which an abort of the turn leaves running. */
       const tasks = new Set<string>();
       /** The root agent's tool calls in flight, with the latest input reported for each. */
@@ -724,6 +826,23 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
         });
       };
       session.events((event) => {
+        if (event.kind === "exited") {
+          const running = turn;
+          const hadTasks = tasks.size > 0;
+          turn = undefined;
+          tasks.clear();
+          calls.clear();
+          // An unexpected exit while a turn or background work was open ends it immediately:
+          // OAR emits `exited` without `turn_ended`, so otherwise a line or runtime waits forever.
+          if (!disposed && (running || hadTasks)) {
+            reportTurnUsage();
+            const reason =
+              event.reason ?? (event.code !== null ? `the harness exited (code ${event.code})` : "the harness exited");
+            events.onTurnEnded({ kind: "failed", failure: "runtime_exited", reason });
+          }
+          return;
+        }
+        events.onProgress?.();
         switch (event.kind) {
           case "task_started":
             if (!event.ambient) tasks.add(event.taskId);
@@ -753,23 +872,35 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
             break;
           }
         }
-        // Work with no turn open: the harness began a turn on its own (Claude Code wakes the
-        // agent when a background command ends). OAR reports turn starts for prompts only.
-        if (
-          !turn &&
-          (event.kind === "tool_call_started" || event.kind === "reasoning" || event.kind === "text_delta")
-        ) {
+        // Work with no turn open: fallback for harnesses that begin a turn on their own without
+        // emitting `turn_active` first.
+        const work = event.kind === "tool_call_started" || event.kind === "reasoning" || event.kind === "text_delta";
+        if (!turn && work) {
           turn = "self";
           turnBase = totals();
           events.onTurnStarted(true);
         }
+        if (work) worked = true;
         switch (event.kind) {
           case "turn_started":
             turn = "prompted";
+            worked = false;
             turnBase = totals();
             events.onTurnStarted();
             break;
+          case "turn_active":
+            // Native active-turn report (e.g. Claude Code waking on a completed background command
+            // before the model emits its first token, or a queued input starting its own turn).
+            if (!turn) {
+              const self = !event.inputId;
+              turn = self ? "self" : "prompted";
+              worked = false;
+              turnBase = totals();
+              events.onTurnStarted(self);
+            }
+            break;
           case "turn_ended": {
+            const empty = turn === "prompted" && !worked;
             turn = undefined;
             // Report before onTurnEnded can deliver another input or reopen the session.
             reportTurnUsage();
@@ -780,6 +911,7 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
               ...(outcome.reason ? { reason: outcome.reason } : {}),
               ...(outcome.kind === "failed" ? { failure: outcome.failure ?? "unknown" } : {}),
               ...(resetsAt > Date.now() ? { resetsAt } : {}),
+              ...(empty && outcome.kind === "completed" ? { empty: true } : {}),
             });
             break;
           }
@@ -793,8 +925,8 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
         }
       });
 
-      // A resumed session has the guide in its history already.
-      let primer = canAppend || resumed ? "" : `${instructions.trim()}\n\n---\n\n`;
+      // A resumed session has the guide in its history, or keeps the one it was opened with.
+      let primer = canAppend || resumed || keptGuide ? "" : `${instructions.trim()}\n\n---\n\n`;
       return {
         id: session.id,
         resumed,
@@ -807,6 +939,9 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
         },
         contextTokens() {
           return session.contextUsage?.().value?.tokens ?? null;
+        },
+        background() {
+          return tasks.size;
         },
         async abort() {
           const running = turn;
@@ -827,6 +962,7 @@ export function oarHarness(source: RuntimeSource = defaultRuntimes, options: { v
           return Boolean(running) || stopping.length > 0;
         },
         async dispose() {
+          disposed = true;
           await session.dispose();
         },
       };

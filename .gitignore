@@ -9,3 +9,4 @@ web/dist/
 site/dist/
 .site-review/
 coverage/
+e2e-lines-*.log

@@ -4,7 +4,8 @@ import type { Platform } from "./api.ts";
  * Each chat app's mark on its brand color, so people find theirs at a glance.
  * Glyphs: Simple Icons (CC0, https://simpleicons.org) for WeChat, QQ, Slack, Discord, Telegram and GitHub;
  * IconPark by ByteDance (Apache-2.0) for Feishu; Ant Design Icons (MIT) for DingTalk;
- * TDesign Icons by Tencent (MIT) for WeCom. iMessage is a plain speech bubble drawn for Mingle (no Apple mark).
+ * TDesign Icons by Tencent (MIT) for WeCom. iMessage is a plain speech bubble drawn for Mingle (no Apple mark),
+ * and the private chat a plain computer.
  */
 const marks: Record<Platform, { color: string; path?: string; svg?: { viewBox: string; body: string } }> = {
   wechat: {
@@ -55,6 +56,14 @@ const marks: Record<Platform, { color: string; path?: string; svg?: { viewBox: s
   imessage: {
     color: "#34C759",
     path: "M12 3C6.48 3 2 6.92 2 11.75c0 2.7 1.4 5.12 3.6 6.72-.12 1.14-.6 2.33-1.6 3.28 2.07-.06 3.83-.86 5.06-1.85.95.22 1.93.35 2.94.35 5.52 0 10-3.92 10-8.75S17.52 3 12 3z",
+  },
+  // The private chat in Mingle itself (docs/spec.md 6.9): a computer, in Mingle's own color.
+  local: {
+    color: "#5450D6",
+    svg: {
+      viewBox: "0 0 24 24",
+      body: `<g fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="4.5" y="5" width="15" height="10.5" rx="1.5"/><path stroke-linecap="round" d="M2.5 19h19"/></g>`,
+    },
   },
 };
 

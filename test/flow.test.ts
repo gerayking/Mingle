@@ -1,9 +1,11 @@
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { scriptedRuntime } from "@botiverse/oar/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Harness, HarnessSession } from "../src/harness/harness.ts";
 import { oarHarness } from "../src/harness/harness.ts";
 import { memorySecrets, type SecretStore } from "../src/platform/secrets.ts";
-import { FakeChannel, messageIds, type Rig, rig, runCli, until } from "./helpers.ts";
+import { FakeChannel, messageIds, type Rig, rig, runCli, runCliNode, until } from "./helpers.ts";
 
 /**
  * End to end: fake chat app → Mingle → OAR scripted harness → real `mingle` CLI
@@ -80,6 +82,35 @@ describe("message flow", () => {
     expect(current.turns[0]?.steered[0]).toContain('from="Li Si"');
   });
 
+  it("steers a text marked to steer into the running turn, keeps others for the next, and knows whom it handles", async () => {
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    current = await rig(async (t) => {
+      if (t.input.includes("note for later")) return;
+      started.resolve();
+      await release.promise;
+      for (const id of messageIds(t.input))
+        await runCli(t.options.env as Record<string, string>, ["message", "reply", id], "ok");
+    });
+    const { mingle, agentId, channel } = current;
+    channel.receive({ text: "plan the route" });
+    await started.promise;
+    const runtime = mingle.runtime(agentId);
+    const chat = mingle.store.agentChats(agentId)[0]?.id as string;
+    expect(runtime?.handling(chat, "u1")).toBe(true);
+    expect(runtime?.handling(chat, "u2")).toBe(false);
+    runtime?.enqueueText("note for later");
+    runtime?.enqueueText("a follow-up", { steer: true, about: { chatId: chat, people: ["u3"] } });
+    await until(() => current?.turns[0]?.steered.length === 1);
+    expect(current.turns[0]?.steered[0]).toContain("a follow-up");
+    expect(runtime?.handling(chat, "u3")).toBe(true);
+    release.resolve();
+    await until(() => current?.turns.length === 2);
+    expect(current.turns[1]?.input).toContain("note for later");
+    // A new turn: whom the last one was handling is forgotten.
+    expect(runtime?.handling(chat, "u1")).toBe(false);
+  });
+
   it("nudges once about unanswered messages, then marks them unanswered", async () => {
     current = await rig(async (t) => {
       // Ignore real messages; only answer when nudged.
@@ -95,6 +126,283 @@ describe("message flow", () => {
     expect(current.turns[1]?.input).toMatch(/^\[mingle\] Not answered yet: m\w+\./);
     const chat = mingle.store.agentChats(current.agentId)[0]?.id as string;
     expect(mingle.store.chatMessages(chat, 10).find((m) => m.direction === "in")?.state).toBe("replied");
+  });
+
+  it("drops the nudge when the agent answers before it is delivered", async () => {
+    // MING-103: the agent started a long command and ended its turn. The command finished and woke
+    // it (a turn the harness began itself) while the reminder waited; it answered then. The
+    // reminder must not arrive afterwards, or the agent answers the same message again.
+    let env: Record<string, string> = {};
+    let wake: { begin(): void; end(): void } | undefined;
+    current = await rig(
+      async (t) => {
+        env = t.options.env as Record<string, string>;
+      },
+      {
+        wrap: (harness) => ({
+          ...harness,
+          open: (options, events) =>
+            harness.open(options, {
+              ...events,
+              onTurnEnded: (outcome) => {
+                events.onTurnEnded(outcome);
+                if (wake) return;
+                // The background command wakes the agent right as its first turn ends.
+                wake = {
+                  begin: () => events.onTurnStarted(true),
+                  end: () => events.onTurnEnded({ kind: "completed" }),
+                };
+                wake.begin();
+              },
+            }),
+        }),
+      },
+    );
+    const { channel } = current;
+    const inbound = channel.receive({ text: "download the files" });
+    await until(() => wake);
+    const chat = current.mingle.store.agentChats(current.agentId)[0]?.id as string;
+    const id = current.mingle.store.messageByPlatformId(chat, inbound.platformId)?.id as string;
+    await runCli(env, ["message", "reply", id], "Downloaded.");
+    wake?.end();
+    await sleep(500);
+    expect(channel.sent.map((m) => m.text)).toEqual(["Downloaded."]);
+    expect(current.turns).toHaveLength(1); // No "Not answered yet" turn.
+  });
+
+  it("waits after a turn the harness ended without running it, then the late answer counts (#125)", async () => {
+    // Kimi Code answers a prompt queued behind its own turn at once, with no model work. The
+    // model sees the message minutes later and answers it then.
+    let env: Record<string, string> = {};
+    current = await rig(
+      async (t) => {
+        env = t.options.env as Record<string, string>;
+      },
+      { emptyTurnWaitMs: 3000 },
+    );
+    const { channel, mingle, agentId } = current;
+    const inbound = channel.receive({ text: "authorized" });
+    await until(() => current?.turns.length === 1);
+    await sleep(200);
+    const chat = mingle.store.agentChats(agentId)[0]?.id as string;
+    const message = mingle.store.messageByPlatformId(chat, inbound.platformId);
+    expect(message?.state).toBe("delivered"); // Not nudged, not given up on.
+    await runCli(env, ["message", "reply", message?.id as string], "Done, all 22 files are filed.");
+    await sleep(3500);
+    expect(current.turns).toHaveLength(1); // No reminder: it was answered.
+    expect(mingle.store.message(message?.id as string)?.state).toBe("replied");
+  });
+
+  it("reminds at once after a turn where the model worked but did not answer (#125)", async () => {
+    current = await rig(
+      async (t) => {
+        if (!t.input.startsWith("[mingle]")) await t.tool("Bash", "ls", async () => {});
+      },
+      { emptyTurnWaitMs: 60_000 },
+    );
+    current.channel.receive({ text: "one" });
+    await until(() => current?.turns.length === 2, 3000);
+    expect(current.turns[1]?.input).toMatch(/^\[mingle\] Not answered yet/);
+  });
+
+  it("after an empty turn and no answer, still reminds once and then gives up (#125)", async () => {
+    current = await rig(async () => {}, { emptyTurnWaitMs: 300 });
+    const { channel, mingle, agentId } = current;
+    const inbound = channel.receive({ text: "authorized" });
+    await until(() => current?.turns.length === 1);
+    await sleep(150);
+    expect(current.turns).toHaveLength(1);
+    await until(() => current?.turns.length === 2);
+    expect(current.turns[1]?.input).toMatch(/^\[mingle\] Not answered yet/);
+    const chat = mingle.store.agentChats(agentId)[0]?.id as string;
+    await until(() => mingle.store.messageByPlatformId(chat, inbound.platformId)?.state === "unanswered");
+    expect(current.turns).toHaveLength(2);
+  });
+
+  it("does not remind about a message the harness queued for its next turn", async () => {
+    // A harness that cannot steer queues input behind the running turn (`delivered … (queued)`)
+    // and runs it as the next turn. When the first turn ends the model has not seen it yet:
+    // a reminder then would race the message itself and arrive stale (as Raft's queuedForNextTurn).
+    let firstDone: () => void = () => {};
+    const first = new Promise<void>((r) => {
+      firstDone = r;
+    });
+    current = await rig(
+      async (t) => {
+        if (t.input.includes("one")) {
+          await first;
+          const [id] = messageIds(t.input);
+          await runCli(t.options.env as Record<string, string>, ["message", "reply", id as string], "done");
+        }
+      },
+      {
+        wrap: (harness) => ({
+          ...harness,
+          open: async (options, events) => {
+            let running = false;
+            const session = await harness.open(options, {
+              ...events,
+              onTurnStarted: (self) => {
+                running = true;
+                events.onTurnStarted(self);
+              },
+              onTurnEnded: (outcome) => {
+                running = false;
+                events.onTurnEnded(outcome);
+              },
+            });
+            return {
+              ...session,
+              deliver: async (text: string, inputId: string) => {
+                const busy = running;
+                const result = await session.deliver(text, inputId);
+                return busy && result.outcome === "steered" ? { outcome: "queued" as const } : result;
+              },
+            };
+          },
+        }),
+      },
+    );
+    const { channel } = current;
+    channel.receive({ text: "one" });
+    await until(() => current?.turns.length === 1);
+    channel.receive({ text: "two" });
+    await until(() => current?.turns[0]?.steered.length === 1);
+    firstDone();
+    await until(() => channel.sent.length === 1);
+    await sleep(500);
+    expect(current.turns.map((t) => t.input).filter((i) => i.startsWith("[mingle] Not answered yet"))).toEqual([]);
+    // Once a turn has run after it, the usual check applies again.
+    channel.receive({ text: "three" });
+    await until(() => current?.turns.some((t) => t.input.startsWith("[mingle] Not answered yet")));
+  });
+
+  it("redelivers a queued message after refreshing the session", async () => {
+    const first = Promise.withResolvers<void>();
+    const logs: string[] = [];
+    let opens = 0;
+    current = await rig(
+      async (t) => {
+        if (t.input.includes("finish-current-turn")) await first.promise;
+        for (const id of messageIds(t.input)) {
+          const result = await runCli(t.options.env as Record<string, string>, ["message", "reply", id], "done");
+          expect(result.code).toBe(0);
+        }
+      },
+      {
+        log: (line) => logs.push(line),
+        wrap: (harness) => ({
+          ...harness,
+          open: async (options, events) => {
+            const isOld = ++opens === 1;
+            const session = await harness.open(options, events);
+            return {
+              ...session,
+              deliver: (text, id) =>
+                isOld && text.includes("queued-for-next-turn")
+                  ? Promise.resolve({ outcome: "queued" as const })
+                  : session.deliver(text, id),
+            };
+          },
+        }),
+      },
+    );
+    const { channel, mingle, agentId } = current;
+    const original = channel.receive({ text: "finish-current-turn" });
+    let second: ReturnType<typeof channel.receive>;
+    try {
+      await until(() => current?.turns.length === 1);
+      second = channel.receive({ text: "queued-for-next-turn" });
+      await until(() => logs.some((line) => line.endsWith("(queued)")));
+      await mingle.runtime(agentId)?.refresh();
+      expect(opens).toBe(1);
+    } finally {
+      first.resolve();
+    }
+    expect((await until(() => channel.sent[0])).replyTo).toBe(original.platformId);
+    expect((await until(() => channel.sent[1])).replyTo).toBe(second.platformId);
+    expect(opens).toBe(2);
+    expect(current.turns.map((turn) => turn.input.includes("queued-for-next-turn"))).toEqual([false, true]);
+  });
+
+  it("does not count a plain send as answering a message the harness only queued (MING-135)", async () => {
+    // A plain `message send` answers what the agent has seen in the chat. A message the harness
+    // queued behind the running turn is not seen yet: marked replied, a session refresh could no
+    // longer hand it back, and it would be lost with the old process.
+    const first = Promise.withResolvers<void>();
+    const logs: string[] = [];
+    let opens = 0;
+    current = await rig(
+      async (t) => {
+        const env = t.options.env as Record<string, string>;
+        if (t.input.includes("finish-current-turn")) {
+          await first.promise;
+          const chat = /chat=(c\w+)/.exec(t.input)?.[1] as string;
+          const result = await runCli(env, ["message", "send", "--to", chat], "working on it");
+          expect(result.code).toBe(0);
+          return;
+        }
+        for (const id of messageIds(t.input)) {
+          const result = await runCli(env, ["message", "reply", id], "done");
+          expect(result.code).toBe(0);
+        }
+      },
+      {
+        log: (line) => logs.push(line),
+        wrap: (harness) => ({
+          ...harness,
+          open: async (options, events) => {
+            const isOld = ++opens === 1;
+            const session = await harness.open(options, events);
+            return {
+              ...session,
+              deliver: (text, id) =>
+                isOld && text.includes("queued-for-next-turn")
+                  ? Promise.resolve({ outcome: "queued" as const })
+                  : session.deliver(text, id),
+            };
+          },
+        }),
+      },
+    );
+    const { channel, mingle, agentId } = current;
+    channel.receive({ text: "finish-current-turn" });
+    let second: ReturnType<typeof channel.receive>;
+    try {
+      await until(() => current?.turns.length === 1);
+      second = channel.receive({ text: "queued-for-next-turn" });
+      await until(() => logs.some((line) => line.endsWith("(queued)")));
+      void mingle.runtime(agentId)?.refresh();
+    } finally {
+      first.resolve();
+    }
+    await until(() => channel.sent.length === 2);
+    expect(channel.sent[0]?.replyTo).toBeUndefined();
+    expect(channel.sent[1]?.replyTo).toBe(second.platformId);
+    expect(opens).toBe(2);
+    expect(current.turns.map((turn) => turn.input.includes("queued-for-next-turn"))).toEqual([false, true]);
+  });
+
+  it("quotes what a reply answers, so a bare '已授权' reads in context (MING-103)", async () => {
+    current = await rig(async (t) => {
+      if (!t.input.includes("download")) return;
+      const [id] = messageIds(t.input);
+      await runCli(
+        t.options.env as Record<string, string>,
+        ["message", "reply", id as string],
+        "The download needs a permission. Open this link to grant it.",
+      );
+    });
+    const { channel } = current;
+    channel.receive({ text: "download the attachments" });
+    await until(() => channel.sent.length === 1);
+    channel.receive({ text: "已授权", replyTo: channel.sent[0]?.platformId as string });
+    const input = await until(() =>
+      current?.turns.flatMap((t) => [t.input, ...t.steered]).find((i) => i.includes("已授权")),
+    );
+    expect(input).toMatch(
+      /reply_to=m\w+ .*\]\n> you: The download needs a permission\. Open this link to grant it\.\n已授权$/,
+    );
   });
 
   it("marks a message unanswered when the agent ignores the nudge too", async () => {
@@ -124,6 +432,131 @@ describe("message flow", () => {
     channel.receive({ text: "/stop", chat: dm });
     const reply = await until(() => channel.sent.find((m) => m.text === "Stopped."));
     expect(reply.chat.platformId).toBe("7");
+  });
+
+  /** Replies to every message the reminder lists. */
+  const answerNudge = async (t: { input: string; options: { env?: unknown }; think: (text: string) => void }) => {
+    const ids = (/Not answered yet: ([^.]+)\./.exec(t.input)?.[1] ?? "").split(", ").filter(Boolean);
+    for (const id of ids)
+      await withProgress(t, runCli(t.options.env as Record<string, string>, ["message", "reply", id], `late ${id}`));
+  };
+
+  /**
+   * A `mingle` CLI call is a subprocess that can outlast the stall watchdog's limit on its own;
+   * a real harness keeps streaming while a command runs, so report thinking until it lands.
+   */
+  const withProgress = async (t: { think: (text: string) => void }, work: Promise<unknown>) => {
+    let done = false;
+    void work.then(
+      () => {
+        done = true;
+      },
+      () => {
+        done = true;
+      },
+    );
+    while (!done) {
+      t.think("still at it");
+      await sleep(200);
+    }
+    await work;
+  };
+
+  it("stops a turn that makes no progress, and answers what was steered into it (#127)", async () => {
+    const lines: string[] = [];
+    current = await rig(
+      async (t) => {
+        if (t.input.startsWith("[mingle] Not answered yet")) return answerNudge(t);
+        // A command that never ends, until the turn is aborted.
+        await t.tool("Bash", "tail -f /dev/null", () => sleep(60_000, t.signal));
+      },
+      { stallMs: 800, log: (line) => lines.push(line) },
+    );
+    const { channel, mingle, agentId } = current;
+    channel.receive({ text: "run it" });
+    await until(() => current?.turns.length === 1);
+    await sleep(100);
+    channel.receive({ text: "are you there?", sender: { id: "u2", name: "Li Si", isBot: false } });
+    await until(() => current?.turns[0]?.steered.length === 1);
+    expect(mingle.store.agent(agentId)?.status).toBe("working");
+    await until(() => channel.sent.length === 2, 5000);
+    expect(lines.some((l) => l.includes("made no progress"))).toBe(true);
+    expect(current.turns).toHaveLength(2);
+    expect(messageIds(current.turns[0]?.input ?? "")).toHaveLength(1);
+    const chat = mingle.store.agentChats(agentId)[0]?.id as string;
+    await until(() => mingle.store.chatMessages(chat, 10).every((m) => m.direction !== "in" || m.state === "replied"));
+    await until(() => mingle.store.agent(agentId)?.status === "idle");
+  });
+
+  it("leaves a silent turn alone until a message waits on it (#127)", async () => {
+    const lines: string[] = [];
+    current = await rig(
+      async (t) => {
+        if (t.input.startsWith("[mingle] Not answered yet")) return answerNudge(t);
+        // Acknowledge, then a long silent job: nobody waits on it.
+        for (const id of messageIds(t.input))
+          await withProgress(t, runCli(t.options.env as Record<string, string>, ["message", "reply", id], "on it"));
+        await t.tool("Bash", "long job", () => sleep(60_000, t.signal));
+      },
+      { stallMs: 400, log: (line) => lines.push(line) },
+    );
+    const { channel } = current;
+    channel.receive({ text: "start the long job" });
+    await until(() => channel.sent.length === 1);
+    await sleep(1500);
+    expect(lines.some((l) => l.includes("made no progress"))).toBe(false);
+    expect(current.turns).toHaveLength(1);
+    // Now someone waits on the silent turn: it is stopped, and the message answered.
+    channel.receive({ text: "how is it going?", sender: { id: "u2", name: "Li Si", isBot: false } });
+    await until(() => channel.sent.length === 2, 5000);
+    expect(lines.some((l) => l.includes("made no progress"))).toBe(true);
+    expect(current.turns[1]?.input).toMatch(/^\[mingle\] Not answered yet/);
+  });
+
+  it("reopens the session when the harness does not end a stuck turn (#127)", async () => {
+    const lines: string[] = [];
+    let opens = 0;
+    current = await rig(
+      async (t) => {
+        if (t.input.startsWith("[mingle] Not answered yet")) return answerNudge(t);
+        // Ignores the abort: only closing the session ends it.
+        await t.tool("Bash", "hang", () => sleep(60_000));
+      },
+      {
+        stallMs: 500,
+        log: (line) => lines.push(line),
+        wrap: (harness) => ({
+          ...harness,
+          open: async (options, events) => {
+            opens++;
+            const session = await harness.open(options, events);
+            return { ...session, abort: async () => true };
+          },
+        }),
+      },
+    );
+    const { channel } = current;
+    channel.receive({ text: "run it" });
+    await until(() => channel.sent.length === 1, 6000);
+    expect(lines.some((l) => l.includes("did not end the stuck turn"))).toBe(true);
+    expect(opens).toBe(2);
+    expect(current.turns[1]?.input).toMatch(/^\[mingle\] Not answered yet/);
+  });
+
+  it("does not stop a long turn that keeps reporting progress (#127)", async () => {
+    const lines: string[] = [];
+    current = await rig(
+      async (t) => {
+        for (let i = 0; i < 6; i++) await t.tool("Bash", `step ${i}`, () => sleep(200));
+        for (const id of messageIds(t.input))
+          await withProgress(t, runCli(t.options.env as Record<string, string>, ["message", "reply", id], "done"));
+      },
+      { stallMs: 500, log: (line) => lines.push(line) },
+    );
+    current.channel.receive({ text: "build it" });
+    await until(() => current?.channel.sent.length === 1, 6000);
+    expect(current.turns).toHaveLength(1);
+    expect(lines.some((l) => l.includes("made no progress"))).toBe(false);
   });
 
   /**
@@ -377,7 +810,8 @@ describe("agent CLI", () => {
     });
     const { channel, mingle } = current;
     channel.receive({ text: "is the ridge route open?" });
-    await until(() => channel.sent.length === 1);
+    // The serial CLI calls above can take most of the default wait on a loaded host.
+    await until(() => channel.sent.length === 1, 25_000);
 
     expect(outputs.chats).toMatch(/^c\w+\s+telegram\s+group\s+Weekend hikes/);
     expect(outputs.read).toContain("is the ridge route open?");
@@ -489,6 +923,300 @@ describe("agent CLI", () => {
     );
   });
 
+  it("runs a reminder's check and wakes the agent only when its output changes", async () => {
+    let env: Record<string, string> = {};
+    const outputs: Record<string, string> = {};
+    const woken: string[] = [];
+    current = await rig(async (t) => {
+      env = t.options.env as Record<string, string>;
+      if (t.input.startsWith("[reminder=")) {
+        woken.push(t.input);
+        return;
+      }
+      const [id] = messageIds(t.input);
+      const set = (...args: string[]) => runCli(env, ["reminder", "set", ...args]);
+      outputs.once = (
+        await set(
+          "Tell them CI finished",
+          "--every",
+          "5m",
+          "--check",
+          "node state.js",
+          "--once",
+          "--from",
+          id as string,
+        )
+      ).stdout;
+      // Through `node <entry>` without a shell: the multiword --check value stays one argument.
+      outputs.every = (
+        await runCliNode(env, [
+          "reminder",
+          "set",
+          "Say what changed",
+          "--every",
+          "5m",
+          "--check",
+          "node state.js",
+          "--from",
+          id as string,
+        ])
+      ).stdout;
+      outputs.broken = (await set("x", "--every", "5m", "--check", "node missing.js")).stderr;
+      outputs.noEvery = (await set("x", "--in", "5m", "--check", "node state.js")).stderr;
+      outputs.often = (await set("x", "--every", "0m", "--check", "node state.js")).stderr;
+      outputs.onceAlone = (await set("x", "--every", "5m", "--once")).stderr;
+      outputs.forBad = (await set("x", "--every", "5m", "--check", "node state.js", "--for", "100d")).stderr;
+      outputs.forAlone = (await set("x", "--every", "5m", "--for", "3d")).stderr;
+      await set("Short wait", "--every", "5m", "--check", "node state.js", "--for", "15m", "--from", id as string);
+      outputs.list = (await runCli(env, ["reminder", "list"])).stdout;
+      await runCli(env, ["message", "reply", id as string], "I'll tell you when CI is done.");
+    });
+    const { channel, mingle } = current;
+    const agentId = current.agentId;
+    const home = mingle.homeDir(mingle.store.agent(agentId) as { slug: string });
+    writeFileSync(
+      join(home, "state.js"),
+      `const s = require("fs").readFileSync("state.txt", "utf8").trim();
+if (s === "broken") { console.error("gh: not logged in"); process.exit(1); }
+console.log("ci: " + s);`,
+    );
+    writeFileSync(join(home, "state.txt"), "pending");
+    channel.receive({ text: "tell me when CI is done" });
+    await until(() => channel.sent.length === 1);
+    await until(() => !mingle.runtime(agentId)?.busy);
+
+    // Setting it runs the check once and shows the baseline; a broken command is refused.
+    expect(outputs.once).toMatch(
+      /^set r\w+, next check at .+, checking until .+; it fires when the output changes from:\nci: pending\n$/,
+    );
+    expect(outputs.broken).toMatch(
+      /^error: check_failed\nnext: the check exited with 1\. Fix the command and set the reminder again; it must exit 0\n$/s,
+    );
+    expect(outputs.every).toMatch(
+      /^set r\w+, next check at .+; it fires when the output changes from:\nci: pending\n$/,
+    );
+    expect(outputs.noEvery).toMatch(/^error: check_needs_every/);
+    expect(outputs.often).toMatch(/^error: check_too_often/);
+    expect(outputs.onceAlone).toMatch(/^error: check_required/);
+    expect(outputs.forBad).toMatch(/^error: check_for_invalid/);
+    expect(outputs.forAlone).toMatch(/^error: check_required/);
+    expect(outputs.list).toMatch(/Tell them CI finished {2}\(from m\w+\)\n {4}check \(once\) until .+: node state\.js/);
+    const byBody = (body: string) => mingle.store.reminders(agentId).find((r) => r.body === body);
+    const once = byBody("Tell them CI finished");
+    const every = byBody("Say what changed");
+    // Seven days unless told otherwise.
+    expect(Math.abs((every?.check?.until ?? 0) - (every?.createdAt ?? 0) - 7 * 86_400_000)).toBeLessThan(60_000);
+    expect(once?.check).toMatchObject({ command: "node state.js", once: true, failures: 0 });
+    // Raw output is never kept: the model has no output field, the column stays empty.
+    expect(once?.check).not.toHaveProperty("output");
+    expect(
+      (
+        mingle.store.db.prepare("SELECT check_output FROM reminders WHERE id = ?").get(once?.id as string) as Record<
+          string,
+          unknown
+        >
+      ).check_output,
+    ).toBeNull();
+    expect(mingle.store.reminders(agentId)).toHaveLength(3);
+
+    // Snoozed past its deadline: the check still ends when its time is up, not at the next poll.
+    const shortWait = byBody("Short wait") as NonNullable<ReturnType<typeof byBody>>;
+    expect((await runCli(env, ["reminder", "snooze", shortWait.id, "--by", "30m"])).code).toBe(0);
+
+    // Nothing changed: checked, nobody woken.
+    const start = Date.now();
+    mingle.fireReminders(start + 10 * 60_000);
+    await mingle.checksSettled();
+    expect(woken).toEqual([]);
+    expect(mingle.store.reminder(agentId, once?.id as string)?.check?.lastCheckedAt).toBeGreaterThan(start - 1);
+    expect(mingle.store.reminder(agentId, once?.id as string)?.lastFiredAt).toBeNull();
+
+    // Its deadline is up while the snoozed poll is still ahead: it ends, told once with the quote.
+    mingle.fireReminders((shortWait.check?.until ?? 0) + 1);
+    await mingle.checksSettled();
+    const heard = () => woken.join("\n\n");
+    await until(() => heard().includes("check=expired"));
+    expect(heard()).toMatch(
+      /\[reminder=r\w+ chat=c\w+ time=.+ check=expired\]\nShort wait\nStopped checking: its time is up\..*> \[msg=/s,
+    );
+    expect(mingle.store.reminder(agentId, shortWait.id)?.nextFireAt).toBeNull();
+
+    // Changed: both fire with the current output; the --once one ends, quoting its message.
+    writeFileSync(join(home, "state.txt"), "pass");
+    mingle.fireReminders(start + 20 * 60_000);
+    await mingle.checksSettled();
+    // Both check results reach the agent, coalesced or not.
+    await until(() => heard().includes("Tell them CI finished") && heard().includes("Say what changed"));
+    expect(heard()).toMatch(
+      /\[reminder=r\w+ chat=c\w+ time=.+ check=changed\]\nTell them CI finished\nCheck output now:\nci: pass\n> \[msg=/,
+    );
+    expect(heard()).toMatch(
+      /\[reminder=r\w+ chat=c\w+ time=.+ check=changed\]\nSay what changed\nCheck output now:\nci: pass\n> \[msg=/,
+    );
+    expect(mingle.store.reminders(agentId).map((r) => r.id)).toEqual([every?.id]);
+
+    // Failing: quiet until the third time in a row, told once, then quiet again.
+    writeFileSync(join(home, "state.txt"), "broken");
+    for (let i = 3; i <= 6; i++) {
+      await until(() => !mingle.runtime(agentId)?.busy);
+      mingle.fireReminders(start + i * 10 * 60_000);
+      await mingle.checksSettled();
+    }
+    await until(() => heard().includes("check=failing"));
+    const told = woken.at(-1) as string;
+    expect(told).toMatch(/check=failing\]\nSay what changed\nThe check has failed 3 times in a row/);
+    // Standard error is dropped: the reason is the exit code alone, and the message is quoted.
+    expect(told).toContain("Last error: exited with 1\n");
+    expect(told).toContain("> [msg=");
+    expect(heard().split("check=failing")).toHaveLength(2);
+    const turns = woken.length;
+    expect(mingle.store.reminder(agentId, every?.id as string)?.check).toMatchObject({
+      failures: 4,
+      error: "exited with 1",
+    });
+
+    // Working again clears the count; cancelling drops a check still in flight.
+    writeFileSync(join(home, "state.txt"), "pass");
+    mingle.fireReminders(start + 70 * 60_000);
+    mingle.store.deleteReminder(agentId, every?.id as string);
+    await mingle.checksSettled();
+    expect(woken).toHaveLength(turns);
+
+    // Cancelling a check that is still running kills the command itself, not just the wake-up.
+    writeFileSync(
+      join(home, "slow.js"),
+      `const fs = require("fs");
+if (fs.existsSync("probe-done.txt")) {
+  fs.writeFileSync("slow-started.txt", "1");
+  setTimeout(() => fs.writeFileSync("survived.txt", "x"), 3000);
+  setTimeout(() => {}, 30000);
+} else {
+  fs.writeFileSync("probe-done.txt", "1");
+  console.log("slow: armed");
+}`,
+    );
+    const set = (...args: string[]) => runCli(env, ["reminder", "set", ...args]);
+    await set("Slow watch", "--every", "5m", "--check", "node slow.js");
+    const slow = mingle.store.reminders(agentId).find((r) => r.body === "Slow watch");
+    mingle.fireReminders(start + 80 * 60_000);
+    // The scheduled run is really up before the cancel lands; then its side effect never may.
+    await until(() => existsSync(join(home, "slow-started.txt")));
+    expect((await runCli(env, ["reminder", "cancel", slow?.id as string])).code).toBe(0);
+    await mingle.checksSettled();
+    await sleep(3600);
+    expect(existsSync(join(home, "survived.txt"))).toBe(false);
+    expect(woken).toHaveLength(turns);
+
+    // A set-up probe cancelled by a pause never registers, even across a fast resume.
+    writeFileSync(
+      join(home, "slow2.js"),
+      `setTimeout(() => require("fs").writeFileSync("probe-survived.txt", "x"), 1500);
+setTimeout(() => {}, 30000);`,
+    );
+    const probe = mingle.probeCheck(agentId, "node slow2.js");
+    await sleep(100);
+    await mingle.pauseAgent(agentId);
+    expect(await probe).toMatchObject({ ok: false, error: "was cancelled" });
+    await mingle.resumeAgent(agentId);
+    await sleep(2200);
+    expect(existsSync(join(home, "probe-survived.txt"))).toBe(false);
+  });
+
+  it("keeps a --for forever check running past 90d until cancelled", async () => {
+    const outputs: Record<string, string> = {};
+    const woken: string[] = [];
+    let env: Record<string, string> = {};
+    current = await rig(async (t) => {
+      env = t.options.env as Record<string, string>;
+      if (t.input.includes("[reminder=")) {
+        woken.push(t.input);
+        return;
+      }
+      const id = messageIds(t.input)[0];
+      const set = (...args: string[]) => runCli(env, ["reminder", "set", ...args]);
+      outputs.forever = (
+        await set(
+          "Watch repo updates",
+          "--every",
+          "5m",
+          "--check",
+          "node state.js",
+          "--for",
+          "forever",
+          "--from",
+          id as string,
+        )
+      ).stdout;
+      outputs.onceForever = (
+        await set(
+          "Watch rare release",
+          "--every",
+          "5m",
+          "--check",
+          "node state.js",
+          "--once",
+          "--for",
+          "forever",
+          "--from",
+          id as string,
+        )
+      ).stdout;
+      outputs.foreverAlone = (await set("x", "--every", "5m", "--for", "forever")).stderr;
+      outputs.badFor = (await set("x", "--every", "5m", "--check", "node state.js", "--for", "never")).stderr;
+      outputs.list = (await runCli(env, ["reminder", "list"])).stdout;
+      await runCli(env, ["message", "reply", id as string], "Watching indefinitely.");
+    });
+    const { channel, mingle, agentId } = current;
+    const home = mingle.homeDir(mingle.store.agent(agentId) as { slug: string });
+    writeFileSync(
+      join(home, "state.js"),
+      `console.log("state: " + require("fs").readFileSync("state.txt", "utf8").trim());`,
+    );
+    writeFileSync(join(home, "state.txt"), "v1");
+    channel.receive({ text: "watch this forever" });
+    await until(() => channel.sent.length === 1);
+    await until(() => !mingle.runtime(agentId)?.busy);
+
+    expect(outputs.forever).toMatch(
+      /^set r\w+, next check at .+, checking forever; it fires when the output changes from:\nstate: v1\n$/,
+    );
+    expect(outputs.onceForever).toMatch(
+      /^set r\w+, next check at .+, checking forever; it fires when the output changes from:\nstate: v1\n$/,
+    );
+    expect(outputs.foreverAlone).toMatch(/^error: check_required/);
+    expect(outputs.badFor).toMatch(/^error: check_for_invalid\nnext: .*--for forever/);
+    expect(outputs.list).toMatch(/Watch repo updates {2}\(from m\w+\)\n {4}check forever: node state\.js/);
+    expect(outputs.list).toMatch(/Watch rare release {2}\(from m\w+\)\n {4}check \(once\) forever: node state\.js/);
+
+    const repoWatch = mingle.store.reminders(agentId).find((r) => r.body === "Watch repo updates");
+    const rareWatch = mingle.store.reminders(agentId).find((r) => r.body === "Watch rare release");
+    expect(repoWatch?.check?.until).toBeNull();
+    expect(rareWatch?.check?.until).toBeNull();
+
+    // Far past the 90d cap (one year later): neither expires, unchanged output stays quiet.
+    const start = Date.now();
+    mingle.fireReminders(start + 365 * 86_400_000);
+    await mingle.checksSettled();
+    expect(woken).toEqual([]);
+    expect(mingle.store.reminders(agentId)).toHaveLength(2);
+
+    // Snoozing keeps it running without expiring; when output changes even later, it fires.
+    expect((await runCli(env, ["reminder", "snooze", repoWatch?.id as string, "--by", "30m"])).code).toBe(0);
+    writeFileSync(join(home, "state.txt"), "v2");
+    mingle.fireReminders(start + 400 * 86_400_000);
+    await mingle.checksSettled();
+    const heard = () => woken.join("\n\n");
+    await until(() => heard().includes("Watch repo updates") && heard().includes("Watch rare release"));
+    expect(heard()).not.toContain("check=expired");
+    expect(heard()).toMatch(/check=changed\]\nWatch repo updates\nCheck output now:\nstate: v2/);
+    // The --once forever check ended after firing once; the repeating forever check stays active.
+    expect(mingle.store.reminders(agentId).map((r) => r.id)).toEqual([repoWatch?.id]);
+
+    // Explicitly cancelling stops it.
+    expect((await runCli(env, ["reminder", "cancel", repoWatch?.id as string])).code).toBe(0);
+    expect(mingle.store.reminders(agentId)).toEqual([]);
+  });
+
   it("refuses to run without an agent session", async () => {
     current = await rig(async () => {});
     const result = await runCli({ MINGLE_CLI: current.mingle.cliPath, MINGLE_API: "", MINGLE_TOKEN: "" }, [
@@ -574,10 +1302,80 @@ describe("admin API (console)", () => {
     expect(anonymous.status).toBe(401);
   });
 
+  it("lists the activity by conversation, keeping what needs the owner however old", async () => {
+    current = await rig(async () => {});
+    const { mingle, agentId, admin } = current;
+    const store = mingle.store;
+    const connection = store.connections(agentId).filter((n) => n.platform !== "local")[0] as { id: string };
+    const dm = store.upsertChat({ connectionId: connection.id, platformId: "u1", kind: "dm", name: "Ann" });
+    const channel = store.upsertChat({ connectionId: connection.id, platformId: "C1", kind: "group", name: "#design" });
+    const thread = store.upsertChat({
+      connectionId: connection.id,
+      platformId: "C1:9",
+      kind: "thread",
+      name: "Release notes",
+      parentId: channel.id,
+    });
+    const t0 = Date.now() - 60_000;
+    const say = (chatId: string, n: number, body: string, triggers = false) =>
+      store.insertInbound({
+        chatId,
+        platformId: `${chatId}-${n}`,
+        senderId: "u1",
+        senderName: "Ann",
+        body,
+        attachments: [],
+        replyTo: null,
+        triggers,
+        createdAt: t0 + n,
+      }) as { id: string };
+    const old = say(dm.id, 0, "the old request", true);
+    store.moveInbound([old.id], "fail");
+    for (let n = 1; n <= 9; n++) say(dm.id, n, `dm ${n}`);
+    say(thread.id, 20, "in the thread");
+
+    type View = {
+      chat: { id: string; kind: string; name: string };
+      parent: { id: string; name: string } | null;
+      earlier: number;
+      cursor: number | null;
+      messages: { body: string; state: string }[];
+    };
+    const views = (await admin("GET", `/v1/admin/agents/${agentId}/conversations`)).json as View[];
+    // Newest conversation first; a thread names the channel it belongs to.
+    expect(views.map((v) => v.chat.name)).toEqual(["Release notes", "Ann"]);
+    expect(views[0]?.parent).toMatchObject({ id: channel.id, name: "#design" });
+    expect(views[1]?.parent).toBeNull();
+    // The latest six, oldest first, and the failed request from before them.
+    expect(views[1]?.messages.map((m) => m.body)).toEqual([
+      "the old request",
+      "dm 4",
+      "dm 5",
+      "dm 6",
+      "dm 7",
+      "dm 8",
+      "dm 9",
+    ]);
+    expect(views[1]?.messages[0]?.state).toBe("failed");
+    expect(views[1]?.earlier).toBe(3);
+
+    // One chat further back, from where the last read stopped.
+    const back = (
+      await admin(
+        "GET",
+        `/v1/admin/agents/${agentId}/conversations?chat=${dm.id}&before=${views[1]?.cursor}&messages=2`,
+      )
+    ).json as View[];
+    expect(back).toHaveLength(1);
+    expect(back[0]?.messages.map((m) => m.body)).toEqual(["the old request", "dm 2", "dm 3"]);
+    expect(back[0]?.earlier).toBe(1);
+    expect((await admin("GET", `/v1/admin/agents/${agentId}/conversations?chat=cnope`)).status).toBe(404);
+  });
+
   it("keeps onboarding complete outside the recent activity window", async () => {
     current = await rig(async () => {});
     const { mingle, agentId, admin } = current;
-    const connection = mingle.store.connections(agentId)[0] as { id: string };
+    const connection = mingle.store.connections(agentId).filter((n) => n.platform !== "local")[0] as { id: string };
     const chat = mingle.store.upsertChat({ connectionId: connection.id, platformId: "history", kind: "dm" });
     const sent = mingle.store.insertOutbound({ chatId: chat.id, body: "First answer", replyTo: null });
     mingle.store.setOutboundResult(sent.id, "sent", "old-answer");
@@ -722,7 +1520,7 @@ describe("agent settings", () => {
     expect(after?.harness).toBe(before?.harness);
     expect(after?.model).toBe(before?.model);
     expect(after?.sessionId).toBe(before?.sessionId);
-    expect(mingle.store.connections(agentId)).toHaveLength(1);
+    expect(mingle.store.connections(agentId).filter((n) => n.platform !== "local")).toHaveLength(1);
   });
 
   it("rejects a model-only change while the current harness is disabled", async () => {
@@ -878,7 +1676,7 @@ describe("waking from sleep", () => {
     await mingle.resume("test");
     expect(channel.closes).toBe(1);
     expect(channel.connects).toBe(2);
-    expect(mingle.store.connections()[0]?.state).toBe("connected");
+    expect(mingle.store.connections().filter((n) => n.platform !== "local")[0]?.state).toBe("connected");
 
     channel.receive({ text: "still there?" });
     await until(() => channel.sent.length === 1);
@@ -887,7 +1685,7 @@ describe("waking from sleep", () => {
   it("keeps trying when the network is not back yet", async () => {
     current = await rig(async () => {});
     const { channel, mingle } = current;
-    const id = mingle.store.connections()[0]?.id as string;
+    const id = mingle.store.connections().filter((n) => n.platform !== "local")[0]?.id as string;
     channel.connectFailures = 2;
     await mingle.resume("test");
     // Offline, but with a time for the next try: never offline with nothing to do.
@@ -903,7 +1701,7 @@ describe("waking from sleep", () => {
   it("starts over when the adapter gives up, and waits for the owner on refused credentials", async () => {
     current = await rig(async () => {});
     const { channel, mingle, admin } = current;
-    const id = mingle.store.connections()[0]?.id as string;
+    const id = mingle.store.connections().filter((n) => n.platform !== "local")[0]?.id as string;
     channel.report({ kind: "error", code: "unknown" });
     expect(mingle.isLive(id)).toBe(false);
     await until(() => mingle.store.connection(id)?.state === "connected");
@@ -930,7 +1728,7 @@ describe("waking from sleep", () => {
   it("names the offline bot when a retry cannot run", async () => {
     current = await rig(async () => {});
     const { channel, mingle, agentId, admin } = current;
-    const id = mingle.store.connections()[0]?.id as string;
+    const id = mingle.store.connections().filter((n) => n.platform !== "local")[0]?.id as string;
     const inbound = channel.receive({ text: "anyone?" });
     const chat = await until(() => mingle.store.agentChats(agentId)[0]?.id);
     await until(() => mingle.store.messageByPlatformId(chat, inbound.platformId)?.state === "unanswered");
@@ -944,7 +1742,7 @@ describe("waking from sleep", () => {
   it("ignores reports from a connection already replaced", async () => {
     current = await rig(async () => {});
     const { channel, mingle } = current;
-    const id = mingle.store.connections()[0]?.id as string;
+    const id = mingle.store.connections().filter((n) => n.platform !== "local")[0]?.id as string;
     const old = (channel as unknown as { events: Parameters<FakeChannel["connect"]>[1] }).events;
     await mingle.reconnect(id);
     old.onState({ kind: "error", code: "credentials_revoked" });
@@ -954,11 +1752,11 @@ describe("waking from sleep", () => {
   it("leaves a connection removed meanwhile alone", async () => {
     current = await rig(async () => {});
     const { channel, mingle } = current;
-    const id = mingle.store.connections()[0]?.id as string;
+    const id = mingle.store.connections().filter((n) => n.platform !== "local")[0]?.id as string;
     const resumed = mingle.resume("test");
     await mingle.removeConnection(id);
     await resumed;
-    expect(mingle.store.connections()).toEqual([]);
+    expect(mingle.store.connections().filter((n) => n.platform !== "local")).toEqual([]);
     expect(mingle.isLive(id)).toBe(false);
     expect(channel.closes).toBe(channel.connects);
   });
@@ -969,7 +1767,10 @@ describe("binding a bot again", () => {
     const secrets = memorySecrets();
     current = await rig(async () => {}, { secrets });
     const { channel, mingle } = current;
-    const first = mingle.store.connections()[0] as { id: string; secretRef: string };
+    const first = mingle.store.connections().filter((n) => n.platform !== "local")[0] as {
+      id: string;
+      secretRef: string;
+    };
     const other = mingle.createAgent({ name: "Bea", role: "", harness: "scripted", model: null });
     // Scanning again issued a new secret, which revokes the one the first connection had.
     channel.onboardCredentials = { token: "rotated" };
@@ -977,7 +1778,12 @@ describe("binding a bot again", () => {
     await expect(mingle.addConnection(other.id, "telegram", { token: "rotated" })).rejects.toMatchObject({
       code: "bot_in_use",
     });
-    expect(mingle.store.connections().map((c) => c.id)).toEqual([first.id]);
+    expect(
+      mingle.store
+        .connections()
+        .filter((n) => n.platform !== "local")
+        .map((c) => c.id),
+    ).toEqual([first.id]);
     expect(JSON.parse((await secrets.get(first.secretRef)) as string)).toEqual({ token: "rotated" });
     expect(channel.lastCredentials).toEqual({ token: "rotated" });
     expect(mingle.store.connection(first.id)?.state).toBe("connected");
@@ -1004,19 +1810,22 @@ describe("binding a bot again", () => {
       mingle.addConnection(other.id, "slack", { token: "y" }),
     ]);
     expect(a.id).toBe(b.id);
-    expect(mingle.store.connections(other.id)).toHaveLength(1);
+    expect(mingle.store.connections(other.id).filter((n) => n.platform !== "local")).toHaveLength(1);
   });
 
   it("rebinds the same agent's bot instead of refusing it", async () => {
     const secrets = memorySecrets();
     current = await rig(async () => {}, { secrets });
     const { channel, mingle, agentId } = current;
-    const first = mingle.store.connections()[0] as { id: string; secretRef: string };
+    const first = mingle.store.connections().filter((n) => n.platform !== "local")[0] as {
+      id: string;
+      secretRef: string;
+    };
     channel.onboardCredentials = { token: "rotated" };
 
     const again = await mingle.addConnection(agentId, "telegram", { token: "rotated" });
     expect(again.id).toBe(first.id);
-    expect(mingle.store.connections()).toHaveLength(1);
+    expect(mingle.store.connections().filter((n) => n.platform !== "local")).toHaveLength(1);
     expect(JSON.parse((await secrets.get(first.secretRef)) as string)).toEqual({ token: "rotated" });
     expect(mingle.store.connection(first.id)?.state).toBe("connected");
   });
@@ -1036,7 +1845,7 @@ describe("contacts", () => {
       for (const id of messageIds(t.input)) await runCli(env, ["message", "reply", id], "ok");
     });
     const { mingle, agentId, admin, channel } = current;
-    const mine = mingle.store.connections(agentId)[0] as { id: string };
+    const mine = mingle.store.connections(agentId).filter((n) => n.platform !== "local")[0] as { id: string };
     mingle.store.updateConnection(mine.id, { ownerId: "me" });
     // A second bot on the same platform, scanned by someone else: it has its own owner.
     const hers = mingle.store.createConnection({ agentId, platform: "telegram", secretRef: "telegram:bot2" });

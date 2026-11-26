@@ -1,6 +1,7 @@
 import {
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
+  memo,
   type ReactNode,
   type Ref,
   type SelectHTMLAttributes,
@@ -14,6 +15,7 @@ import {
 import { createPortal } from "react-dom";
 import type { AgentStatus } from "./api.ts";
 import { useI18n } from "./i18n.ts";
+import { type Keys, keysAria, keysLabel, useShortcutHints, withMod } from "./shortcuts.ts";
 
 /** The building blocks DESIGN.md defines. Nothing here takes a raw color. */
 
@@ -78,42 +80,182 @@ export function Input({ className = "", ...props }: InputHTMLAttributes<HTMLInpu
   return <input className={`h-[34px] ${control} ${className}`} {...props} />;
 }
 
-export function Textarea({ className = "", ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
-  return <textarea className={`min-h-24 resize-y py-2 leading-5 ${control} ${className}`} {...props} />;
+/** Return writes a new line; Command-Return (Ctrl+Enter elsewhere) submits the form it is in. */
+export function Textarea({ className = "", onKeyDown, ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  return (
+    <textarea
+      className={`min-h-24 resize-y py-2 leading-5 ${control} ${className}`}
+      onKeyDown={(event) => {
+        onKeyDown?.(event);
+        if (event.defaultPrevented || event.key !== "Enter" || !withMod(event) || event.nativeEvent.isComposing) return;
+        const form = event.currentTarget.form;
+        if (!form) return;
+        event.preventDefault();
+        // As Return in a field: nothing while the form's button is disabled (busy, or not ready).
+        const button = form.querySelector<HTMLButtonElement>("button[type=submit]");
+        if (!button?.disabled) form.requestSubmit(button ?? undefined);
+      }}
+      {...props}
+    />
+  );
 }
 
 export function Select({ className = "", ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
   return <select className={`h-[34px] ${control} ${className}`} {...props} />;
 }
 
-/** A row of choices where one is on: appearance, language. */
+/** A row of choices where one is on: appearance, language, an agent's tabs (with their keys). */
 export function Segmented<T extends string>({
   value,
   options,
   onChange,
+  onPrefetch,
   label,
 }: {
   value: T;
-  options: { value: T; label: string }[];
+  options: { value: T; label: string; keys?: Keys }[];
   onChange: (value: T) => void;
+  /** Warm the target view when the pointer or focus rests on an inactive choice. */
+  onPrefetch?: (value: T) => void;
   label: string;
 }) {
   return (
     <div role="radiogroup" aria-label={label} className="inline-flex rounded-control bg-bg3 p-0.5">
-      {options.map((o) => (
-        // biome-ignore lint/a11y/useSemanticElements: a styled choice; a native radio cannot take this look
-        <button
-          key={o.value}
-          type="button"
-          role="radio"
-          aria-checked={value === o.value}
-          onClick={() => onChange(o.value)}
-          className="h-7 rounded-small px-3 text-small text-ink2 transition-colors duration-[120ms] aria-checked:bg-card aria-checked:font-medium aria-checked:text-ink aria-checked:shadow-card"
-        >
-          {o.label}
-        </button>
-      ))}
+      {options.map((o) => {
+        const warm = onPrefetch && o.value !== value ? () => onPrefetch(o.value) : undefined;
+        const choice = (
+          // biome-ignore lint/a11y/useSemanticElements: a styled choice; a native radio cannot take this look
+          <button
+            key={o.value}
+            type="button"
+            role="radio"
+            aria-checked={value === o.value}
+            aria-keyshortcuts={o.keys ? keysAria(o.keys) : undefined}
+            onClick={() => onChange(o.value)}
+            onPointerEnter={warm}
+            onFocus={warm}
+            className="h-7 rounded-small px-3 text-small text-ink2 transition-colors duration-[120ms] aria-checked:bg-card aria-checked:font-medium aria-checked:text-ink aria-checked:shadow-card"
+          >
+            {o.label}
+          </button>
+        );
+        return o.keys ? (
+          <Shortcut key={o.value} label={o.label} keys={o.keys} side="bottom">
+            {choice}
+          </Shortcut>
+        ) : (
+          choice
+        );
+      })}
     </div>
+  );
+}
+
+/** A key as it is printed on the keyboard: "⌘N", "Ctrl+N". */
+export function Kbd({ keys, className = "" }: { keys: Keys; className?: string }) {
+  return (
+    <kbd
+      className={`inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-[5px] border border-line2 bg-bg2 px-1 font-sans text-[11px] leading-none font-medium tracking-[0.02em] whitespace-nowrap text-ink2 ${className}`}
+    >
+      {keysLabel(keys)}
+    </kbd>
+  );
+}
+
+/** Moving from one tooltip to the next shows it at once, as in macOS. */
+let tipShownAt = 0;
+const TIP_DELAY = 400;
+const TIP_WARM = 600;
+
+/**
+ * A button that has a shortcut. Pointing at it shows its name and keys in a small tooltip, soon
+ * and without the browser's long delay; holding the modifier shows the keys beside it for every
+ * such button at once (useShortcutHints). Touch shows neither.
+ */
+export function Shortcut({
+  label,
+  keys,
+  side,
+  className = "",
+  children,
+}: {
+  label: string;
+  keys: Keys | undefined;
+  /** Where the tooltip and the held-modifier key go: right of a sidebar row, or below a button. */
+  side: "right" | "bottom";
+  className?: string;
+  children: ReactNode;
+}) {
+  const hints = useShortcutHints();
+  const box = useRef<HTMLSpanElement>(null);
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const [at, setAt] = useState<{ x: number; y: number } | null>(null);
+  const tip = useRef<HTMLSpanElement>(null);
+  const id = useId();
+  useEffect(() => () => clearTimeout(timer.current), []);
+  // Kept inside the window: the header's buttons sit near its right edge.
+  useLayoutEffect(() => {
+    const el = tip.current;
+    if (!el || !at) return;
+    const r = el.getBoundingClientRect();
+    const shift = Math.min(0, innerWidth - 8 - r.right) || Math.max(0, 8 - r.left);
+    if (shift) el.style.marginLeft = `${shift}px`;
+  }, [at]);
+  if (!keys) return <>{children}</>;
+  const show = (now: boolean) => {
+    clearTimeout(timer.current);
+    const place = () => {
+      const r = box.current?.getBoundingClientRect();
+      if (!r) return;
+      setAt(
+        side === "right" ? { x: r.right + 8, y: r.top + r.height / 2 } : { x: r.left + r.width / 2, y: r.bottom + 6 },
+      );
+      tipShownAt = Date.now();
+    };
+    if (now || Date.now() - tipShownAt < TIP_WARM) place();
+    else timer.current = setTimeout(place, TIP_DELAY);
+  };
+  const hide = () => {
+    clearTimeout(timer.current);
+    if (at) tipShownAt = Date.now();
+    setAt(null);
+  };
+  return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: it only watches the button it wraps, to show its tooltip
+    <span
+      ref={box}
+      className={`relative ${side === "right" ? "flex" : "inline-flex"} ${className}`}
+      aria-describedby={at ? id : undefined}
+      onPointerEnter={(e) => e.pointerType === "mouse" && show(false)}
+      onPointerLeave={hide}
+      onPointerDown={hide}
+      onFocus={(e) => e.target.matches(":focus-visible") && show(true)}
+      onBlur={hide}
+      onKeyDown={(e) => e.key === "Escape" && hide()}
+    >
+      {children}
+      <span
+        aria-hidden="true"
+        className={`pointer-events-none absolute z-30 transition-opacity duration-[120ms] ${hints ? "opacity-100" : "opacity-0"} ${side === "right" ? "top-1/2 right-2 -translate-y-1/2" : "top-full left-1/2 mt-1.5 -translate-x-1/2"}`}
+      >
+        <Kbd keys={keys} className="shadow-card" />
+      </span>
+      {at && !hints
+        ? createPortal(
+            <span
+              ref={tip}
+              id={id}
+              role="tooltip"
+              style={{ left: at.x, top: at.y }}
+              className={`pointer-events-none fixed z-50 flex max-w-[280px] items-center gap-2 rounded-control border border-line bg-card py-1 pr-1 pl-2.5 text-small text-ink shadow-card ${side === "right" ? "-translate-y-1/2" : "-translate-x-1/2"}`}
+            >
+              <span className="min-w-0 truncate">{label}</span>
+              <Kbd keys={keys} />
+            </span>,
+            document.body,
+          )
+        : null}
+    </span>
   );
 }
 
@@ -129,30 +271,36 @@ export function Group({ children, className = "" }: { children: ReactNode; class
 export function GroupRow({
   children,
   className = "",
+  align = "center",
+  compact = false,
   onClick,
   id,
   tabIndex,
 }: {
   children: ReactNode;
   className?: string;
+  align?: "center" | "start";
+  /** Sizes rows tightly around content (44px min height, 12px vertical padding) instead of 52px. */
+  compact?: boolean;
   onClick?: () => void;
   /** Lets a link elsewhere on the page land on this row. */
   id?: string;
   tabIndex?: number;
 }) {
+  const layout = `flex ${compact ? "min-h-[44px] py-3" : "min-h-[52px] py-2.5"} ${align === "start" ? "items-start" : "items-center"} gap-3 px-4`;
   if (onClick) {
     return (
       <button
         type="button"
         onClick={onClick}
-        className={`flex min-h-[52px] w-full items-center gap-3 px-4 py-2.5 text-left transition-colors duration-[120ms] hover:bg-bg2 ${className}`}
+        className={`${layout} w-full text-left transition-colors duration-[120ms] hover:bg-bg2 ${className}`}
       >
         {children}
       </button>
     );
   }
   return (
-    <div id={id} tabIndex={tabIndex} className={`flex min-h-[52px] items-center gap-3 px-4 py-2.5 ${className}`}>
+    <div id={id} tabIndex={tabIndex} className={`${layout} ${className}`}>
       {children}
     </div>
   );
@@ -199,11 +347,19 @@ const dot: Record<string, string> = {
   paused: "border-[1.5px] border-ink3",
 };
 
-export function StatusDot({ state }: { state: string }) {
+export const StatusDot = memo(function StatusDot({ state }: { state: string }) {
   return <span aria-hidden className={`inline-block size-2 shrink-0 rounded-full ${dot[state] ?? "bg-ink3"}`} />;
-}
+});
 
-export function Avatar({ name, src, size = 32 }: { name: string; src?: string | null; size?: number }) {
+export const Avatar = memo(function Avatar({
+  name,
+  src,
+  size = 32,
+}: {
+  name: string;
+  src?: string | null;
+  size?: number;
+}) {
   const [broken, setBroken] = useState<string | null>(null);
   const radius = Math.round(size * 0.28);
   if (src && broken !== src) {
@@ -213,6 +369,7 @@ export function Avatar({ name, src, size = 32 }: { name: string; src?: string | 
         src={src}
         width={size}
         height={size}
+        decoding="async"
         draggable={false}
         onError={() => setBroken(src)}
         style={{ width: size, height: size, borderRadius: radius }}
@@ -240,7 +397,7 @@ export function Avatar({ name, src, size = 32 }: { name: string; src?: string | 
       {initial}
     </span>
   );
-}
+});
 
 export function Spinner({ size = 14 }: { size?: number }) {
   return (
@@ -394,9 +551,12 @@ export function PageHeader({
 export function MoreMenu({
   label,
   items,
+  trigger,
 }: {
   label: string;
-  items: { label: string; onSelect: () => void; danger?: boolean }[];
+  items: { label: string; onSelect: () => void; danger?: boolean; checked?: boolean }[];
+  /** A word in a sentence that opens the menu instead of the "…" button; the panel opens under its start. */
+  trigger?: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState({ top: 0, left: 0 });
@@ -416,18 +576,33 @@ export function MoreMenu({
       const top = below + height <= window.innerHeight - margin ? below : anchor.top - height - 4;
       setPosition({
         top: Math.max(margin, Math.min(top, window.innerHeight - height - margin)),
-        left: Math.max(margin, Math.min(anchor.right - width, window.innerWidth - width - margin)),
+        left: Math.max(
+          margin,
+          Math.min(trigger ? anchor.left : anchor.right - width, window.innerWidth - width - margin),
+        ),
       });
     };
     place();
-    menu.current?.querySelector<HTMLButtonElement>("button")?.focus({ preventScroll: true });
-    addEventListener("resize", place);
-    addEventListener("scroll", place, true);
-    return () => {
-      removeEventListener("resize", place);
-      removeEventListener("scroll", place, true);
+    (
+      menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]') ??
+      menu.current?.querySelector<HTMLButtonElement>("button")
+    )?.focus({ preventScroll: true });
+    let frame = 0;
+    const schedule = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        place();
+      });
     };
-  }, [open]);
+    addEventListener("resize", schedule, { passive: true });
+    addEventListener("scroll", schedule, { capture: true, passive: true });
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      removeEventListener("resize", schedule);
+      removeEventListener("scroll", schedule, true);
+    };
+  }, [open, trigger]);
   useEffect(() => {
     if (!open) return;
     const close = (event: MouseEvent | KeyboardEvent) => {
@@ -447,19 +622,35 @@ export function MoreMenu({
     };
   }, [open]);
   const restore = () => box.current?.querySelector("button")?.focus({ preventScroll: true });
+  const Box = trigger ? "span" : "div";
   return (
-    <div ref={box} className="relative">
-      <Button
-        variant="ghost"
-        small
-        aria-label={label}
-        aria-haspopup="menu"
-        aria-controls={open ? menuId : undefined}
-        aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
-      >
-        <MoreIcon />
-      </Button>
+    <Box ref={box} className={trigger ? "relative inline" : "relative"}>
+      {trigger ? (
+        <button
+          type="button"
+          aria-label={label}
+          aria-haspopup="menu"
+          aria-controls={open ? menuId : undefined}
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+          className="inline-flex items-baseline gap-0.5 rounded-small text-ink2 underline decoration-line2 decoration-dashed underline-offset-[3px] transition-colors duration-[120ms] hover:text-ink hover:decoration-ink3 focus-visible:outline-2 focus-visible:outline-accent"
+        >
+          {trigger}
+          <ChevronIcon className="self-center text-ink3" />
+        </button>
+      ) : (
+        <Button
+          variant="ghost"
+          small
+          aria-label={label}
+          aria-haspopup="menu"
+          aria-controls={open ? menuId : undefined}
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+        >
+          <MoreIcon />
+        </Button>
+      )}
       {open
         ? createPortal(
             <div
@@ -468,28 +659,31 @@ export function MoreMenu({
               role="menu"
               aria-label={label}
               style={position}
-              className="fixed z-50 flex w-44 max-w-[calc(100vw-16px)] max-h-[calc(100vh-16px)] flex-col overflow-y-auto rounded-control border border-line bg-card p-1 shadow-card"
+              className={`fixed z-50 flex ${trigger ? "w-max min-w-44 max-w-[min(20rem,calc(100vw-16px))]" : "w-44 max-w-[calc(100vw-16px)]"} max-h-[calc(100vh-16px)] flex-col overflow-y-auto rounded-control border border-line bg-card p-1 shadow-card`}
             >
               {items.map((item) => (
                 <button
                   key={item.label}
                   type="button"
-                  role="menuitem"
+                  {...(item.checked === undefined
+                    ? { role: "menuitem" }
+                    : { role: "menuitemradio", "aria-checked": item.checked })}
                   onClick={() => {
                     setOpen(false);
                     restore();
                     item.onSelect();
                   }}
-                  className={`flex min-h-8 shrink-0 items-center rounded-small px-2.5 py-1 text-left text-body wrap-anywhere hover:bg-bg3 ${item.danger ? "text-red" : ""}`}
+                  className={`flex min-h-8 shrink-0 items-center gap-2 rounded-small px-2.5 py-1 text-left text-body wrap-anywhere hover:bg-bg3 focus-visible:bg-bg3 focus-visible:outline-none ${item.danger ? "text-red" : ""}`}
                 >
-                  {item.label}
+                  <span className="min-w-0 flex-1">{item.label}</span>
+                  {item.checked ? <CheckIcon className="shrink-0 text-accent" /> : null}
                 </button>
               ))}
             </div>,
             document.body,
           )
         : null}
-    </div>
+    </Box>
   );
 }
 
@@ -532,18 +726,33 @@ export function HelpTip({ label, children }: { label: string; children: ReactNod
   );
 }
 
-export function AgentStatusText({ status, detail }: { status: AgentStatus; detail?: string | null }) {
+export const AgentStatusText = memo(function AgentStatusText({
+  status,
+  detail,
+  where,
+  more,
+}: {
+  status: AgentStatus;
+  detail?: string | null;
+  /** The SSH host it runs on; the status reads "unknown" while that host is out of reach. */
+  where?: { host: string; reachable: boolean };
+  /** What follows, such as the chat apps in the sidebar. */
+  more?: string;
+}) {
   const { t } = useI18n();
+  const known = where?.reachable !== false;
   return (
     <span className="flex min-w-0 items-center gap-1.5">
-      <StatusDot state={status} />
+      {known ? <StatusDot state={status} /> : null}
       <span className="truncate">
-        {t(`status.${status}`)}
-        {detail && status === "working" ? ` · ${detail}` : ""}
+        {known ? t(`status.${status}`) : t("ssh.unknown")}
+        {known && detail && status === "working" ? ` · ${detail}` : ""}
+        {where ? ` · ${where.host}` : ""}
+        {more ? ` · ${more}` : ""}
       </span>
     </span>
   );
-}
+});
 
 /** Copy text, falling back to a hidden text area where the clipboard API is not offered (some webviews). */
 export async function copyText(text: string): Promise<boolean> {
@@ -660,9 +869,27 @@ export const AlertIcon = (p: { className?: string }) => (
     <path d="M8 6.2v3.3M8 11.6v.1" />
   </Icon>
 );
+export const ChevronIcon = (p: { className?: string }) => (
+  <Icon {...p} size={12}>
+    <path d="m4.5 6.5 3.5 3.5 3.5-3.5" />
+  </Icon>
+);
+/** A thread under its channel: a line that turns into the reply. */
+export const ThreadIcon = (p: { className?: string }) => (
+  <Icon {...p} size={12}>
+    <path d="M4 2.5v6a2.5 2.5 0 0 0 2.5 2.5H13M10.5 8.5 13 11l-2.5 2.5" />
+  </Icon>
+);
 export const MoreIcon = (p: { className?: string }) => (
   <Icon {...p}>
     <path d="M3.5 8h.01M8 8h.01M12.5 8h.01" strokeWidth="2.2" />
+  </Icon>
+);
+/** A dice face: pick a random value (a generated name). */
+export const DiceIcon = (p: { className?: string }) => (
+  <Icon {...p}>
+    <rect x="2.5" y="2.5" width="11" height="11" rx="2.75" />
+    <path d="M5.7 5.7h.01M10.3 5.7h.01M5.7 10.3h.01M10.3 10.3h.01" strokeWidth="2" />
   </Icon>
 );
 export const ArrowUpRight = (p: { className?: string }) => (
@@ -706,33 +933,111 @@ export const ChatIcon = (p: { className?: string }) => (
 );
 
 // ------------------------------------------------------------------ time
+// Intl formatters are expensive to construct; reuse one per locale so lists render without jank.
+
+function cachedFormatter<T>(map: Map<string, T>, key: string, create: () => T): T {
+  let formatter = map.get(key);
+  if (!formatter) {
+    formatter = create();
+    map.set(key, formatter);
+  }
+  return formatter;
+}
+
+const timeFmt = new Map<string, Intl.DateTimeFormat>();
+const weekdayFmt = new Map<string, Intl.DateTimeFormat>();
+const monthDayFmt = new Map<string, Intl.DateTimeFormat>();
+const dayThisYearFmt = new Map<string, Intl.DateTimeFormat>();
+const dayOtherYearFmt = new Map<string, Intl.DateTimeFormat>();
+const relTimeFmt = new Map<string, Intl.RelativeTimeFormat>();
+const intFmt = new Map<string, Intl.NumberFormat>();
+const decFmt = new Map<string, Intl.NumberFormat>();
+
+const getTimeFmt = (locale: string) =>
+  cachedFormatter(
+    timeFmt,
+    locale,
+    () => new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", hour12: false }),
+  );
+const getWeekdayFmt = (locale: string) =>
+  cachedFormatter(weekdayFmt, locale, () => new Intl.DateTimeFormat(locale, { weekday: "short" }));
+const getMonthDayFmt = (locale: string) =>
+  cachedFormatter(monthDayFmt, locale, () => new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }));
+const getDayFmt = (locale: string, sameYear: boolean) =>
+  sameYear
+    ? cachedFormatter(
+        dayThisYearFmt,
+        locale,
+        () => new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", weekday: "short" }),
+      )
+    : cachedFormatter(
+        dayOtherYearFmt,
+        locale,
+        () => new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", weekday: "short", year: "numeric" }),
+      );
+const getRelFmt = (locale: string) =>
+  cachedFormatter(relTimeFmt, locale, () => new Intl.RelativeTimeFormat(locale, { numeric: "auto" }));
+
+/** "09:00", formatted with a reused Intl.DateTimeFormat. */
+export function clockTime(ms: number, locale: string): string {
+  return getTimeFmt(locale).format(ms);
+}
+
+/** The day a run of messages was said on: "Today", "Yesterday", or the date. */
+export function dayLabel(ms: number, locale: string): string {
+  const date = new Date(ms);
+  const now = new Date();
+  const start = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((start(date) - start(now)) / 86_400_000);
+  if (days === 0 || days === -1) {
+    const word = getRelFmt(locale).format(days, "day");
+    return word.charAt(0).toUpperCase() + word.slice(1);
+  }
+  return getDayFmt(locale, date.getFullYear() === now.getFullYear()).format(date);
+}
+
+/** Human-readable file size with cached Intl.NumberFormat. */
+export function formatBytes(bytes: number | null, locale: string): string {
+  if (bytes === null) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let n = bytes;
+  let u = 0;
+  while (n >= 1024 && u < units.length - 1) {
+    n /= 1024;
+    u++;
+  }
+  const fmt = u
+    ? cachedFormatter(decFmt, locale, () => new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }))
+    : cachedFormatter(intFmt, locale, () => new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }));
+  return `${fmt.format(n)} ${units[u]}`;
+}
 
 /** "Yesterday 09:00", "Tomorrow 20:02", "Thu 09:00", or "Nov 20, 09:00" for further out. */
 export function shortDateTime(ms: number, locale: string): string {
   const date = new Date(ms);
-  const time = date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", hour12: false });
+  const time = getTimeFmt(locale).format(date);
   const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
   const days = Math.round((startOfDay(date) - startOfDay(new Date())) / 86_400_000);
   if (days >= -1 && days <= 1) {
-    const word = new Intl.RelativeTimeFormat(locale, { numeric: "auto" }).format(days, "day");
+    const word = getRelFmt(locale).format(days, "day");
     return `${word} ${time}`;
   }
-  if (days > 1 && days < 7) return `${date.toLocaleDateString(locale, { weekday: "short" })} ${time}`;
-  return `${date.toLocaleDateString(locale, { month: "short", day: "numeric" })} ${time}`;
+  if (days > 1 && days < 7) return `${getWeekdayFmt(locale).format(date)} ${time}`;
+  return `${getMonthDayFmt(locale).format(date)} ${time}`;
 }
 
 export function relativeTime(ms: number, locale: string): string {
   const diff = (ms - Date.now()) / 1000;
-  const rtf = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+  const rtf = getRelFmt(locale);
   const abs = Math.abs(diff);
   if (abs < 45) return rtf.format(0, "second");
   if (abs < 3600) return rtf.format(Math.round(diff / 60), "minute");
   if (abs < 86400) return rtf.format(Math.round(diff / 3600), "hour");
-  return new Date(ms).toLocaleDateString(locale, { month: "short", day: "numeric" });
+  return getMonthDayFmt(locale).format(ms);
 }
 
 /** The harness's own mark, for the light or dark background it sits on. */
-export function HarnessIcon({
+export const HarnessIcon = memo(function HarnessIcon({
   harness,
   size = 24,
 }: {
@@ -742,8 +1047,8 @@ export function HarnessIcon({
   if (!harness.icon) return <Avatar name={harness.name} size={size} />;
   return (
     <span className="flex shrink-0 items-center justify-center" style={{ width: size, height: size }}>
-      <img src={harness.icon.light} alt="" className="size-full dark:hidden" />
-      <img src={harness.icon.dark} alt="" className="hidden size-full dark:block" />
+      <img src={harness.icon.light} alt="" decoding="async" className="size-full dark:hidden" />
+      <img src={harness.icon.dark} alt="" decoding="async" className="hidden size-full dark:block" />
     </span>
   );
-}
+});

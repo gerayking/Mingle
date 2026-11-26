@@ -1,9 +1,11 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 import type { ChatKind, Platform } from "../channels/channel.ts";
+import type { HearTier } from "../core/hearing.ts";
 import { shortId } from "../core/ids.ts";
 import { INBOUND, type InboundEvent } from "../core/inbound.ts";
 import { searchTerms } from "../core/terms.ts";
+import { defaultProxySettings, type ProxyMode, type ProxySettings } from "../platform/proxy.ts";
 
 export type AgentStatus = "offline" | "idle" | "thinking" | "working" | "error" | "paused";
 export type ConnectionStateKind = "awaiting_credentials" | "awaiting_approval" | "connected" | "reconnecting" | "error";
@@ -37,6 +39,10 @@ export interface Agent {
   hasReplied: boolean;
   /** Ask the owner about new people and groups on every chat app, not only public ones (docs/spec.md 4.7). */
   askAll: boolean;
+  /** Give the agent a daily turn to tidy its memory while it is idle (docs/spec.md 4.5). */
+  tidy: boolean;
+  /** Up to when the owner has seen the private chat in the console (docs/spec.md 6.9). */
+  chatSeenAt: number;
   createdAt: number;
 }
 
@@ -92,6 +98,8 @@ export interface Contact {
   personName: string | null;
   /** Who put it in its person. Only the owner's links may carry anything beyond a name and a note. */
   linkedBy: LinkedBy | null;
+  /** Their department and title as the chat app reports them, where member profiles are on. */
+  profile: string | null;
   updatedAt: number;
 }
 
@@ -116,6 +124,15 @@ export function contactName(
 /** Contacts with their person's name. */
 const CONTACTS = "SELECT k.*, p.name AS person_name FROM contacts k LEFT JOIN people p ON p.id = k.person_id";
 
+/**
+ * How often a group that hears everything reaches the agent: Mingle's own pace (`auto`), at most once
+ * per `ms` (`every`), or not at all until someone addresses the agent there (`muted`).
+ */
+export type HearPace =
+  | { readonly kind: "auto" }
+  | { readonly kind: "every"; readonly ms: number }
+  | { readonly kind: "muted" };
+
 export interface Chat {
   id: string;
   connectionId: string;
@@ -126,6 +143,16 @@ export interface Chat {
   parentId: string | null;
   /** Groups only: whether the owner let this group in. */
   access: Access;
+  /** Groups only: the owner set it to hear every message, not only those addressed to the agent (docs/spec.md 4.2). */
+  listen: boolean;
+  /** Groups only: how often what it hears reaches the agent, as the agent set it (docs/spec.md 4.2). */
+  hearPace: HearPace;
+  /** Groups only: how fast it keeps up with a conversation there, as the owner chose; null follows the group's size. */
+  hearTier: HearTier | null;
+  /** Groups only: other names that count as calling the agent there (docs/spec.md 4.2). */
+  aliases: string[];
+  /** Direct chats only: the other person's ID on the platform, when known. */
+  peerId: string | null;
 }
 
 export interface Attachment {
@@ -151,7 +178,14 @@ export interface Message {
   createdAt: number;
   /** Inbound, while `waiting`: when Mingle delivers it again. */
   retryAt?: number | null;
+  /** Outbound: Mingle's own words in the chat, not the agent's (docs/spec.md 4.7). */
+  notice?: boolean;
+  /** The task whose line sent it, or a follow-up Mingle handed to that line (docs/spec.md 4.13). */
+  lineTaskId?: string | null;
 }
+
+/** Where a task's line is (docs/spec.md 4.13); null for a task that is only a note. */
+export type LineState = "queued" | "running" | "idle" | "ended" | "error";
 
 export interface Task {
   id: string;
@@ -160,6 +194,20 @@ export interface Task {
   status: TaskStatus;
   fromMessage: string | null;
   fromChat: string | null;
+  /** A task the agent works on in a line of its own (docs/spec.md 4.13). */
+  lineState: LineState | null;
+  sessionId: string | null;
+  brief: string | null;
+  /** What the line reported when it finished. */
+  summary: string | null;
+  lineError: string | null;
+  /**
+   * The thread the line talks in (docs/spec.md 4.13): opened under the message it works for, or the
+   * thread that message was already in. Null where there is none.
+   */
+  threadChat: string | null;
+  /** How far the line is, in one line: the latest it said in its thread or reported with `task status`. */
+  progress: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -176,6 +224,24 @@ export interface Reminder {
   nextFireAt: number | null;
   lastFiredAt: number | null;
   createdAt: number;
+  /** A shell command Mingle runs on the rule; the reminder fires only when its output changes. */
+  check: ReminderCheck | null;
+}
+
+/** The check of a reminder that fires on change (docs/spec.md 4.6). */
+export interface ReminderCheck {
+  command: string;
+  /** Ends after the first change. */
+  once: boolean;
+  /** SHA-256 of the trimmed output it compares against; the output itself is never stored. */
+  hash: string | null;
+  /** Failed runs in a row; 0 after a run that worked. */
+  failures: number;
+  /** Why the last run failed, while it keeps failing. */
+  error: string | null;
+  lastCheckedAt: number | null;
+  /** When it stops checking (docs/spec.md 4.6). */
+  until: number | null;
 }
 
 type Row = Record<string, SQLInputValue>;
@@ -186,6 +252,7 @@ const MIGRATIONS = new URL("./migrations/", import.meta.url);
 export class Store {
   readonly db: DatabaseSync;
   private readonly now: () => number;
+  private readonly statements = new Map<string, StatementSync>();
 
   constructor(path: string, now: () => number = Date.now) {
     this.now = now;
@@ -195,7 +262,18 @@ export class Store {
     if (from < 6) this.backfillContacts();
   }
 
+  /** Reuse compiled SQLite statements across hot console polling queries. */
+  private stmt(sql: string): StatementSync {
+    let compiled = this.statements.get(sql);
+    if (!compiled) {
+      compiled = this.db.prepare(sql);
+      this.statements.set(sql, compiled);
+    }
+    return compiled;
+  }
+
   close(): void {
+    this.statements.clear();
     this.db.close();
   }
 
@@ -268,18 +346,70 @@ export class Store {
   }
 
   agent(id: string): Agent | undefined {
-    const row = this.db.prepare("SELECT * FROM agents WHERE id = ? OR slug = ?").get(id, id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM agents WHERE id = ? OR slug = ?").get(id, id) as Row | undefined;
     return row && toAgent(row);
   }
 
   agents(): Agent[] {
-    return (this.db.prepare("SELECT * FROM agents ORDER BY created_at").all() as Row[]).map(toAgent);
+    return (this.stmt("SELECT * FROM agents ORDER BY created_at").all() as Row[]).map(toAgent);
+  }
+
+  /** Agent IDs in the user's saved sidebar order (local and remote IDs). */
+  agentOrder(): string[] {
+    return (this.stmt("SELECT agent_id FROM agent_order ORDER BY position").all() as Row[]).map((r) =>
+      String(r.agent_id),
+    );
+  }
+
+  /** Replace the saved sidebar order. Duplicates and empty strings are ignored. */
+  setAgentOrder(ids: readonly string[]): string[] {
+    const clean: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of ids) {
+      const id = raw.trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      clean.push(id);
+    }
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM agent_order").run();
+      const insert = this.db.prepare("INSERT INTO agent_order (agent_id, position) VALUES (?, ?)");
+      for (let i = 0; i < clean.length; i++) insert.run(clean[i] as string, i);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return clean;
+  }
+
+  /**
+   * Sort agents by the saved sidebar order. Agents not present in the saved order keep
+   * their original relative order after the ordered ones.
+   */
+  orderByAgentOrder<T extends { id?: unknown }>(items: readonly T[]): T[] {
+    const order = this.agentOrder();
+    if (order.length === 0 || items.length < 2) return [...items];
+    const rank = new Map(order.map((id, i) => [id, i]));
+    return items
+      .map((item, index) => ({
+        item,
+        index,
+        pos: typeof item.id === "string" ? (rank.get(item.id) ?? Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER,
+      }))
+      .sort((a, b) => a.pos - b.pos || a.index - b.index)
+      .map((entry) => entry.item);
   }
 
   setAgentStatus(id: string, status: AgentStatus, detail: string | null = null, failure: string | null = null): void {
-    this.db
-      .prepare("UPDATE agents SET status = ?, status_detail = ?, status_failure = ?, updated_at = ? WHERE id = ?")
-      .run(status, detail, failure, this.now(), id);
+    this.stmt("UPDATE agents SET status = ?, status_detail = ?, status_failure = ?, updated_at = ? WHERE id = ?").run(
+      status,
+      detail,
+      failure,
+      this.now(),
+      id,
+    );
   }
 
   updateAgent(id: string, patch: { name?: string; harness?: string; model?: string | null }): void {
@@ -296,6 +426,47 @@ export class Store {
 
   setAskAll(id: string, on: boolean): void {
     this.db.prepare("UPDATE agents SET ask_all = ?, updated_at = ? WHERE id = ?").run(on ? 1 : 0, this.now(), id);
+  }
+
+  /** The owner has seen the private chat up to `at`; never moves back. */
+  setChatSeen(id: string, at: number): void {
+    this.stmt("UPDATE agents SET chat_seen_at = MAX(chat_seen_at, ?) WHERE id = ?").run(at, id);
+  }
+
+  /** What the agent said in a chat after `since`: how many messages, and the latest. Mingle's notices left out. */
+  saidSince(chatId: string, since: number): { count: number; last: Message | undefined } {
+    const row = this.stmt(
+      "SELECT COUNT(*) AS n FROM messages WHERE chat_id = ? AND direction = 'out' AND notice = 0 AND state <> 'failed' AND created_at > ?",
+    ).get(chatId, since) as { n: number };
+    if (Number(row.n) === 0) return { count: 0, last: undefined };
+    const last = this.stmt(
+      "SELECT * FROM messages WHERE chat_id = ? AND direction = 'out' AND notice = 0 AND state <> 'failed' AND created_at > ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    ).get(chatId, since) as Row | undefined;
+    return { count: Number(row.n), last: last && toMessage(last) };
+  }
+
+  setTidy(id: string, on: boolean): void {
+    this.db.prepare("UPDATE agents SET tidy = ?, updated_at = ? WHERE id = ?").run(on ? 1 : 0, this.now(), id);
+  }
+
+  /** When the agent was last given its memory tidy-up (docs/spec.md 4.5), or null if never. */
+  tidyAt(id: string): number | null {
+    const row = this.db.prepare("SELECT tidy_at FROM agents WHERE id = ?").get(id) as Row | undefined;
+    return row?.tidy_at == null ? null : Number(row.tidy_at);
+  }
+
+  setTidyAt(id: string, at: number): void {
+    this.db.prepare("UPDATE agents SET tidy_at = ? WHERE id = ?").run(at, id);
+  }
+
+  /** When the agent's running turn began, or null when none runs (docs/spec.md 7.1). */
+  turnAt(id: string): number | null {
+    const row = this.db.prepare("SELECT turn_at FROM agents WHERE id = ?").get(id) as Row | undefined;
+    return row?.turn_at == null ? null : Number(row.turn_at);
+  }
+
+  setTurnAt(id: string, at: number | null): void {
+    this.db.prepare("UPDATE agents SET turn_at = ? WHERE id = ?").run(at, id);
   }
 
   setAvatar(id: string, file: string | null): void {
@@ -371,6 +542,7 @@ export class Store {
   }
 
   deleteAgent(id: string): void {
+    this.db.prepare("DELETE FROM agent_order WHERE agent_id = ?").run(id);
     this.db.prepare("DELETE FROM agents WHERE id = ?").run(id);
   }
 
@@ -409,14 +581,14 @@ export class Store {
   }
 
   connection(id: string): Connection | undefined {
-    const row = this.db.prepare("SELECT * FROM connections WHERE id = ?").get(id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM connections WHERE id = ?").get(id) as Row | undefined;
     return row && toConnection(row);
   }
 
   connections(agentId?: string): Connection[] {
     const rows = agentId
-      ? this.db.prepare("SELECT * FROM connections WHERE agent_id = ? ORDER BY created_at").all(agentId)
-      : this.db.prepare("SELECT * FROM connections ORDER BY created_at").all();
+      ? this.stmt("SELECT * FROM connections WHERE agent_id = ? ORDER BY created_at").all(agentId)
+      : this.stmt("SELECT * FROM connections ORDER BY created_at").all();
     return (rows as Row[]).map(toConnection);
   }
 
@@ -454,6 +626,8 @@ export class Store {
     kind: ChatKind;
     name?: string | undefined;
     parentId?: string | undefined;
+    /** Direct chats: the other person. */
+    peerId?: string | undefined;
   }): Chat {
     const existing = this.db
       .prepare("SELECT * FROM chats WHERE connection_id = ? AND platform_id = ?")
@@ -470,27 +644,66 @@ export class Store {
           .prepare("UPDATE chats SET parent_id = ?, updated_at = ? WHERE id = ?")
           .run(input.parentId, t, String(existing.id));
       }
+      if (input.peerId && !existing.peer_id) {
+        this.db
+          .prepare("UPDATE chats SET peer_id = ?, updated_at = ? WHERE id = ?")
+          .run(input.peerId, t, String(existing.id));
+      }
       return this.chat(String(existing.id)) as Chat;
     }
     const id = this.mint("chats", "c", 4);
     this.db
       .prepare(
-        "INSERT INTO chats (id, connection_id, platform_id, kind, name, parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chats (id, connection_id, platform_id, kind, name, parent_id, peer_id, listen, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(id, input.connectionId, input.platformId, input.kind, input.name ?? null, input.parentId ?? null, t, t);
+      .run(
+        id,
+        input.connectionId,
+        input.platformId,
+        input.kind,
+        input.name ?? null,
+        input.parentId ?? null,
+        input.peerId ?? null,
+        // A group hears everything by default (docs/spec.md 4.2); the owner can turn it off.
+        input.kind === "group" ? 1 : 0,
+        t,
+        t,
+      );
     return this.chat(id) as Chat;
   }
 
+  /** The direct chat with this person on this bot, if there is one. */
+  directChat(connectionId: string, peerId: string): Chat | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM chats WHERE connection_id = ? AND kind = 'dm' AND peer_id = ? ORDER BY created_at LIMIT 1",
+      )
+      .get(connectionId, peerId) as Row | undefined;
+    return row && toChat(row);
+  }
+
+  /**
+   * The platform named the chat once it existed: a direct chat opened by addressing the person gets
+   * the chat's own ID, so their replies land in it. Kept as it was if another chat already has that ID.
+   */
+  renameChatPlatformId(id: string, platformId: string): void {
+    try {
+      this.db.prepare("UPDATE chats SET platform_id = ?, updated_at = ? WHERE id = ?").run(platformId, this.now(), id);
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+    }
+  }
+
   chat(id: string): Chat | undefined {
-    const row = this.db.prepare("SELECT * FROM chats WHERE id = ?").get(id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM chats WHERE id = ?").get(id) as Row | undefined;
     return row && toChat(row);
   }
 
   /** The chat, if it belongs to one of this agent's connections. */
   agentChat(agentId: string, chatId: string): Chat | undefined {
-    const row = this.db
-      .prepare("SELECT c.* FROM chats c JOIN connections n ON n.id = c.connection_id WHERE c.id = ? AND n.agent_id = ?")
-      .get(chatId, agentId) as Row | undefined;
+    const row = this.stmt(
+      "SELECT c.* FROM chats c JOIN connections n ON n.id = c.connection_id WHERE c.id = ? AND n.agent_id = ?",
+    ).get(chatId, agentId) as Row | undefined;
     return row && toChat(row);
   }
 
@@ -536,14 +749,15 @@ export class Store {
   }
 
   contact(id: string): Contact | undefined {
-    const row = this.db.prepare(`${CONTACTS} WHERE k.id = ?`).get(id) as Row | undefined;
+    const row = this.stmt(`${CONTACTS} WHERE k.id = ?`).get(id) as Row | undefined;
     return row && toContact(row);
   }
 
   contactByPlatformId(connectionId: string, platformId: string): Contact | undefined {
-    const row = this.db
-      .prepare(`${CONTACTS} WHERE k.connection_id = ? AND k.platform_id = ?`)
-      .get(connectionId, platformId) as Row | undefined;
+    const row = this.stmt(`${CONTACTS} WHERE k.connection_id = ? AND k.platform_id = ?`).get(
+      connectionId,
+      platformId,
+    ) as Row | undefined;
     return row && toContact(row);
   }
 
@@ -556,6 +770,7 @@ export class Store {
   }
 
   /** Everyone this agent knows, most recently changed first. */
+  /** The people the agent met in its chat apps. The private chat's one person, the owner, is not one of them. */
   agentContacts(agentId: string): (Contact & { platform: Platform; owner: boolean })[] {
     const rows = this.db
       .prepare(
@@ -563,10 +778,41 @@ export class Store {
                 (n.owner_id IS NOT NULL AND n.owner_id = k.platform_id) AS is_owner
          FROM contacts k JOIN connections n ON n.id = k.connection_id
          LEFT JOIN people p ON p.id = k.person_id
-         WHERE n.agent_id = ? ORDER BY k.updated_at DESC`,
+         WHERE n.agent_id = ? AND n.platform <> 'local' ORDER BY k.updated_at DESC`,
       )
       .all(agentId) as Row[];
     return rows.map((r) => ({ ...toContact(r), platform: String(r.platform) as Platform, owner: r.is_owner === 1 }));
+  }
+
+  /**
+   * Whom the agent can @-mention in a chat: everyone on that bot, with whether they spoke in the
+   * chat (or the group a thread belongs to), which settles two people with the same name.
+   */
+  mentionCandidates(chat: Chat): (Contact & { spoke: boolean })[] {
+    const rows = this.db
+      .prepare(
+        `SELECT k.*, p.name AS person_name,
+                EXISTS (SELECT 1 FROM messages m
+                        WHERE m.chat_id IN (?, ?) AND m.direction = 'in' AND m.sender_id = k.platform_id) AS spoke
+         FROM contacts k LEFT JOIN people p ON p.id = k.person_id
+         WHERE k.connection_id = ?`,
+      )
+      .all(chat.id, chat.parentId ?? chat.id, chat.connectionId) as Row[];
+    return rows.map((r) => ({ ...toContact(r), spoke: r.spoke === 1 }));
+  }
+
+  /** This agent's contacts who have written to one of its bots: who the owner has seen talk to it. */
+  contactsWhoWrote(agentId: string): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT k.id FROM contacts k JOIN connections n ON n.id = k.connection_id
+         WHERE n.agent_id = ? AND EXISTS (
+           SELECT 1 FROM messages m JOIN chats c ON c.id = m.chat_id
+           WHERE c.connection_id = k.connection_id AND m.direction = 'in' AND m.sender_id = k.platform_id
+         )`,
+      )
+      .all(agentId) as Row[];
+    return new Set(rows.map((r) => String(r.id)));
   }
 
   setContactAccess(id: string, access: Access): void {
@@ -575,6 +821,26 @@ export class Store {
 
   setChatAccess(id: string, access: Access): void {
     this.db.prepare("UPDATE chats SET access = ?, updated_at = ? WHERE id = ?").run(access, this.now(), id);
+  }
+
+  setChatListen(id: string, listen: boolean): void {
+    this.db.prepare("UPDATE chats SET listen = ?, updated_at = ? WHERE id = ?").run(listen ? 1 : 0, this.now(), id);
+  }
+
+  setChatHearTier(id: string, tier: HearTier | null): void {
+    this.db.prepare("UPDATE chats SET hear_tier = ?, updated_at = ? WHERE id = ?").run(tier, this.now(), id);
+  }
+
+  setChatAliases(id: string, aliases: readonly string[]): void {
+    this.db
+      .prepare("UPDATE chats SET aliases = ?, updated_at = ? WHERE id = ?")
+      .run(aliases.length > 0 ? JSON.stringify(aliases) : null, this.now(), id);
+  }
+
+  setChatHearPace(id: string, pace: HearPace): void {
+    this.db
+      .prepare("UPDATE chats SET hear_pace = ?, hear_every_ms = ?, updated_at = ? WHERE id = ?")
+      .run(pace.kind === "auto" ? null : pace.kind, pace.kind === "every" ? pace.ms : null, this.now(), id);
   }
 
   /**
@@ -607,18 +873,22 @@ export class Store {
 
   /** This agent's messages waiting for the owner to let their sender or group in, oldest first. */
   heldMessages(agentId: string): (Message & { chat: Chat; connectionId: string; platform: Platform })[] {
-    const rows = this.db
-      .prepare(
-        `SELECT m.*, n.platform, c.connection_id FROM messages m JOIN chats c ON c.id = m.chat_id
-         JOIN connections n ON n.id = c.connection_id
-         WHERE n.agent_id = ? AND m.state = 'held' ORDER BY m.created_at, m.rowid`,
-      )
-      .all(agentId) as Row[];
+    const rows = this.stmt(
+      `SELECT m.*, n.platform, c.connection_id FROM messages m JOIN chats c ON c.id = m.chat_id
+       JOIN connections n ON n.id = c.connection_id
+       WHERE n.agent_id = ? AND m.state = 'held' ORDER BY m.created_at, m.rowid`,
+    ).all(agentId) as Row[];
+    const chats = new Map<string, Chat>();
     return rows.map((r) => {
       const message = toMessage(r);
+      let chat = chats.get(message.chatId);
+      if (!chat) {
+        chat = this.chat(message.chatId) as Chat;
+        chats.set(message.chatId, chat);
+      }
       return {
         ...message,
-        chat: this.chat(message.chatId) as Chat,
+        chat,
         connectionId: String(r.connection_id),
         platform: String(r.platform) as Platform,
       };
@@ -638,6 +908,11 @@ export class Store {
   }
 
   /** Mark a contact as a bot, or as a person again. */
+  /** What the chat app says about where they sit; null when it no longer says. */
+  setContactProfile(id: string, profile: string | null): void {
+    this.db.prepare("UPDATE contacts SET profile = ? WHERE id = ?").run(profile, id);
+  }
+
   setContactBot(id: string, isBot: boolean): Contact | undefined {
     this.db.prepare("UPDATE contacts SET is_bot = ?, updated_at = ? WHERE id = ?").run(isBot ? 1 : 0, this.now(), id);
     return this.contact(id);
@@ -832,14 +1107,42 @@ export class Store {
     return shortId("f", 7);
   }
 
-  insertOutbound(input: { chatId: string; body: string; replyTo: string | null }): Message {
+  insertOutbound(input: {
+    chatId: string;
+    body: string;
+    replyTo: string | null;
+    notice?: boolean;
+    lineTaskId?: string | null;
+    /** Files sent with it: `ref` is their path on this computer. */
+    attachments?: Omit<Attachment, "id">[];
+  }): Message {
     const id = this.mint("messages", "m", 5);
+    const attachments = (input.attachments ?? []).map((a) => ({ ...a, id: this.mintFileId() }));
     this.db
       .prepare(
-        `INSERT INTO messages (id, chat_id, direction, body, reply_to, state, created_at) VALUES (?, ?, 'out', ?, ?, 'pending', ?)`,
+        `INSERT INTO messages (id, chat_id, direction, body, attachments, reply_to, state, notice, line_task_id, created_at) VALUES (?, ?, 'out', ?, ?, ?, 'pending', ?, ?, ?)`,
       )
-      .run(id, input.chatId, input.body, input.replyTo, this.now());
+      .run(
+        id,
+        input.chatId,
+        input.body,
+        attachments.length ? JSON.stringify(attachments) : null,
+        input.replyTo,
+        input.notice ? 1 : 0,
+        input.lineTaskId ?? null,
+        this.now(),
+      );
     return this.message(id) as Message;
+  }
+
+  /** The message went somewhere else than the chat it was sent to: the thread a reply opened under it. */
+  setMessageChat(id: string, chatId: string): void {
+    this.db.prepare("UPDATE messages SET chat_id = ? WHERE id = ?").run(chatId, id);
+  }
+
+  /** Hand an inbound message to a task's line (docs/spec.md 4.13). */
+  setMessageLine(id: string, taskId: string): void {
+    this.db.prepare("UPDATE messages SET line_task_id = ? WHERE id = ?").run(taskId, id);
   }
 
   setOutboundResult(id: string, state: OutboundState, platformId: string | null): void {
@@ -921,13 +1224,19 @@ export class Store {
     return row && toMessage(row);
   }
 
-  chatMessages(chatId: string, limit: number, before?: string): Message[] {
-    const anchor = before ? (this.message(before)?.createdAt ?? Number.MAX_SAFE_INTEGER) : Number.MAX_SAFE_INTEGER;
-    const rows = this.db
-      .prepare(
-        "SELECT * FROM messages WHERE chat_id = ? AND created_at < ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
-      )
-      .all(chatId, anchor, limit) as Row[];
+  chatMessages(chatId: string, limit: number, before?: string, opts?: { excludeNotices?: boolean }): Message[] {
+    // Before the anchor in the order stored: one stored in the same millisecond still came first.
+    const anchor = before
+      ? (this.stmt("SELECT created_at, rowid FROM messages WHERE id = ?").get(before) as
+          | { created_at: number; rowid: number }
+          | undefined)
+      : undefined;
+    const at = anchor ? Number(anchor.created_at) : Number.MAX_SAFE_INTEGER;
+    const row = anchor ? Number(anchor.rowid) : Number.MAX_SAFE_INTEGER;
+    const filter = opts?.excludeNotices ? " AND notice = 0" : "";
+    const rows = this.stmt(
+      `SELECT * FROM messages WHERE chat_id = ?${filter} AND (created_at < ? OR (created_at = ? AND rowid < ?)) ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+    ).all(chatId, at, at, row, limit) as Row[];
     return rows.map(toMessage).reverse();
   }
 
@@ -974,6 +1283,95 @@ export class Store {
     return rows.map(toMessage);
   }
 
+  /** When the agent first spoke in this chat itself at or after `at` (notices do not count), if it has. */
+  firstSpokeAt(chatId: string, at: number): number | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT min(created_at) AS at FROM messages WHERE chat_id = ? AND direction = 'out' AND notice = 0
+         AND state IN ('sent', 'uncertain') AND created_at >= ?`,
+      )
+      .get(chatId, at) as Row;
+    return row.at == null ? undefined : Number(row.at);
+  }
+
+  /** When the agent last spoke in this chat itself (Mingle's own notices do not count), if it has. */
+  lastSpokeAt(chatId: string): number | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT max(created_at) AS at FROM messages WHERE chat_id = ? AND direction = 'out' AND notice = 0
+         AND state IN ('sent', 'uncertain')`,
+      )
+      .get(chatId) as Row;
+    return row.at == null ? undefined : Number(row.at);
+  }
+
+  /**
+   * The latest messages in this chat that did not reach the agent, from `from` on, oldest first, at
+   * most `limit` (docs/spec.md 4.2, a group that hears everything).
+   */
+  background(chatId: string, from: number, limit: number): Message[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM messages WHERE chat_id = ? AND direction = 'in' AND triggers = 0 AND created_at >= ?
+         ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+      )
+      .all(chatId, from, limit) as Row[];
+    return rows.map(toMessage).reverse();
+  }
+
+  /**
+   * Like `background`, but the messages of `first` (the people in a conversation with the agent) come
+   * before the rest: theirs fill the limit first, the newest of the others the room left. Oldest first.
+   */
+  backgroundFor(chatId: string, from: number, first: ReadonlySet<string>, limit: number): Message[] {
+    if (first.size === 0) return this.background(chatId, from, limit);
+    const all = this.background(chatId, from, Number.MAX_SAFE_INTEGER);
+    if (all.length <= limit) return all;
+    const theirs = all.filter((m) => m.senderId !== null && first.has(m.senderId)).slice(-limit);
+    const keep = new Set(theirs);
+    const others = all.filter((m) => !keep.has(m));
+    for (const m of others.slice(Math.max(0, others.length - (limit - theirs.length)))) keep.add(m);
+    return all.filter((m) => keep.has(m));
+  }
+
+  /**
+   * What the agent said in this chat after `after` (Mingle's notices do not count), oldest first, and
+   * who sent the message each one quotes (docs/spec.md 4.2: whom it answered).
+   */
+  spokenSince(chatId: string, after: number): { createdAt: number; quotedSender: string | null }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT m.created_at AS at, q.sender_id AS quoted FROM messages m LEFT JOIN messages q ON q.id = m.reply_to
+         WHERE m.chat_id = ? AND m.direction = 'out' AND m.notice = 0 AND m.state IN ('sent', 'uncertain')
+         AND m.created_at > ? ORDER BY m.created_at, m.rowid`,
+      )
+      .all(chatId, after) as Row[];
+    return rows.map((r) => ({ createdAt: Number(r.at), quotedSender: str(r.quoted) }));
+  }
+
+  /** The people (not bots) who spoke in a group or its threads since `since` (docs/spec.md 4.2). */
+  activePeople(groupId: string, since: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT count(DISTINCT m.sender_id) AS n FROM messages m JOIN chats c ON c.id = m.chat_id
+         LEFT JOIN contacts k ON k.connection_id = c.connection_id AND k.platform_id = m.sender_id
+         WHERE (c.id = ? OR c.parent_id = ?) AND m.direction = 'in' AND m.sender_id IS NOT NULL
+         AND m.created_at >= ? AND coalesce(k.is_bot, 0) = 0`,
+      )
+      .get(groupId, groupId, since) as Row;
+    return Number(row.n);
+  }
+
+  /** How many messages `background(chatId, from, …)` could return without a limit. */
+  backgroundCount(chatId: string, from: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT count(*) AS n FROM messages WHERE chat_id = ? AND direction = 'in' AND triggers = 0 AND created_at >= ?`,
+      )
+      .get(chatId, from) as Row;
+    return Number(row.n);
+  }
+
   /**
    * How many messages in this chat, and in the chat its thread belongs to, did not reach the
    * agent since it last spoke there (docs/spec.md 4.2). "There" is the whole channel: the chat,
@@ -986,7 +1384,7 @@ export class Store {
     const marks = scope.map(() => "?").join(", ");
     const spoke = this.db
       .prepare(
-        `SELECT max(created_at) AS at FROM messages WHERE direction = 'out' AND state IN ('sent', 'uncertain')
+        `SELECT max(created_at) AS at FROM messages WHERE direction = 'out' AND notice = 0 AND state IN ('sent', 'uncertain')
          AND created_at <= ? AND chat_id IN (SELECT id FROM chats WHERE id IN (${marks}) OR parent_id IN (${marks}))`,
       )
       .get(before, ...scope, ...scope) as Row;
@@ -1028,15 +1426,81 @@ export class Store {
 
   /** Recent messages across all of an agent's chats, newest first, for the console. */
   agentActivity(agentId: string, limit: number): (Message & { chat: Chat; platform: Platform })[] {
-    const rows = this.db
-      .prepare(
-        `SELECT m.*, n.platform FROM messages m JOIN chats c ON c.id = m.chat_id JOIN connections n ON n.id = c.connection_id
-         WHERE n.agent_id = ? ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`,
-      )
-      .all(agentId, limit) as Row[];
+    const rows = this.stmt(
+      `SELECT m.*, n.platform FROM messages m JOIN chats c ON c.id = m.chat_id JOIN connections n ON n.id = c.connection_id
+       WHERE n.agent_id = ? ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`,
+    ).all(agentId, limit) as Row[];
+    const chats = new Map<string, Chat>();
     return rows.map((r) => {
       const message = toMessage(r);
-      return { ...message, chat: this.chat(message.chatId) as Chat, platform: String(r.platform) as Platform };
+      let chat = chats.get(message.chatId);
+      if (!chat) {
+        chat = this.chat(message.chatId) as Chat;
+        chats.set(message.chatId, chat);
+      }
+      return { ...message, chat, platform: String(r.platform) as Platform };
+    });
+  }
+
+  /**
+   * The agent's chats that spoke most recently, newest first, each with its latest messages
+   * (oldest first) for the console. Messages that still need the owner (unanswered, failed,
+   * waiting, held) come along however old, so a busy chat cannot hide them. `before` pages one
+   * chat further back.
+   */
+  agentConversations(
+    agentId: string,
+    opts: { chats: number; messages: number; chatId?: string; before?: number },
+  ): {
+    chat: Chat;
+    parent: Chat | null;
+    platform: Platform;
+    latestAt: number;
+    /** How many older messages are not shown; `cursor` as `before` reads them. */
+    earlier: number;
+    cursor: number | null;
+    messages: Message[];
+  }[] {
+    const scope = opts.chatId ? "AND c.id = ?" : "";
+    const heads = this.stmt(
+      `SELECT c.id, n.platform, max(m.created_at) AS latest FROM messages m JOIN chats c ON c.id = m.chat_id
+       JOIN connections n ON n.id = c.connection_id WHERE n.agent_id = ? ${scope}
+       GROUP BY c.id ORDER BY latest DESC, max(m.rowid) DESC LIMIT ?`,
+    ).all(agentId, ...(opts.chatId ? [opts.chatId] : []), opts.chats) as Row[];
+    const before = opts.before ?? Number.MAX_SAFE_INTEGER;
+    const latestStmt = this.stmt(
+      "SELECT * FROM messages WHERE chat_id = ? AND created_at < ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+    );
+    const pendingStmt = this.stmt(
+      `SELECT * FROM messages WHERE chat_id = ? AND direction = 'in' AND created_at < ?
+       AND state IN ('unanswered', 'failed', 'waiting', 'held')`,
+    );
+    const countStmt = this.stmt("SELECT count(*) AS n FROM messages WHERE chat_id = ? AND created_at < ?");
+    const chats = new Map<string, Chat>();
+    const chatById = (id: string) => {
+      let chat = chats.get(id);
+      if (!chat) {
+        chat = this.chat(id);
+        if (chat) chats.set(id, chat);
+      }
+      return chat;
+    };
+    return heads.map((h) => {
+      const chat = chatById(String(h.id)) as Chat;
+      const latest = (latestStmt.all(chat.id, before, opts.messages) as Row[]).map(toMessage);
+      const oldest = latest.at(-1);
+      const pending = oldest ? (pendingStmt.all(chat.id, oldest.createdAt) as Row[]).map(toMessage) : [];
+      const shown = [...latest, ...pending].sort((a, b) => a.createdAt - b.createdAt);
+      const total = Number((countStmt.get(chat.id, before) as Row).n);
+      return {
+        chat,
+        parent: chat.parentId ? (chatById(chat.parentId) ?? null) : null,
+        platform: String(h.platform) as Platform,
+        latestAt: Number(h.latest),
+        earlier: total - shown.length,
+        cursor: oldest?.createdAt ?? null,
+        messages: shown,
+      };
     });
   }
 
@@ -1050,7 +1514,7 @@ export class Store {
     const rows = this.db
       .prepare(
         `SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id JOIN connections n ON n.id = c.connection_id
-         WHERE n.agent_id = ? AND ((m.direction = 'in' AND m.triggers = 1 AND m.state NOT IN ('ignored', 'held')) OR (m.direction = 'out' AND m.state IN ('sent', 'uncertain')))
+         WHERE n.agent_id = ? AND ((m.direction = 'in' AND m.triggers = 1 AND m.state NOT IN ('ignored', 'held')) OR (m.direction = 'out' AND m.notice = 0 AND m.state IN ('sent', 'uncertain')))
          ${exclude.length ? `AND m.id NOT IN (${marks})` : ""}
          ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?`,
       )
@@ -1063,10 +1527,31 @@ export class Store {
     const rows = this.db
       .prepare(
         `SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id JOIN connections n ON n.id = c.connection_id
-         WHERE n.agent_id = ? AND m.direction = 'in' AND m.state = 'delivered' ORDER BY m.created_at`,
+         WHERE n.agent_id = ? AND m.direction = 'in' AND m.state = 'delivered' AND m.line_task_id IS NULL
+         ORDER BY m.created_at`,
       )
       .all(agentId) as Row[];
     return rows.map(toMessage);
+  }
+
+  /** Follow-ups handed to a line and not answered yet (docs/spec.md 4.13), oldest first. */
+  lineInbox(taskId: string): Message[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM messages WHERE line_task_id = ? AND direction = 'in' AND state = 'delivered' ORDER BY created_at",
+      )
+      .all(taskId) as Row[];
+    return rows.map(toMessage);
+  }
+
+  /** Whether the agent sent anything into this chat after `at`: a reply to another message, or a plain send. */
+  spokeSince(chatId: string, at: number): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT 1 FROM messages WHERE chat_id = ? AND direction = 'out' AND notice = 0 AND state = 'sent' AND created_at >= ? LIMIT 1",
+      )
+      .get(chatId, at);
+    return row !== undefined;
   }
 
   markNudged(ids: readonly string[]): void {
@@ -1081,12 +1566,10 @@ export class Store {
 
   /** Inbound messages of this agent the owner can retry or ignore (waiting, failed or unanswered), oldest first; `ids` narrows it. */
   retryable(agentId: string, ids?: readonly string[]): Message[] {
-    const rows = this.db
-      .prepare(
-        `SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id JOIN connections n ON n.id = c.connection_id
-         WHERE n.agent_id = ? AND m.direction = 'in' AND m.state IN ('waiting', 'failed', 'unanswered') ORDER BY m.created_at`,
-      )
-      .all(agentId) as Row[];
+    const rows = this.stmt(
+      `SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id JOIN connections n ON n.id = c.connection_id
+       WHERE n.agent_id = ? AND m.direction = 'in' AND m.state IN ('waiting', 'failed', 'unanswered') ORDER BY m.created_at`,
+    ).all(agentId) as Row[];
     const wanted = ids && new Set(ids);
     return rows.map(toMessage).filter((m) => !wanted || wanted.has(m.id));
   }
@@ -1125,7 +1608,7 @@ export class Store {
     const row = this.db
       .prepare(
         `SELECT max(CASE WHEN m.direction = 'in' AND m.triggers = 1 THEN m.created_at END) AS in_at,
-                max(CASE WHEN m.direction = 'out' AND m.state = 'sent' THEN m.created_at END) AS out_at
+                max(CASE WHEN m.direction = 'out' AND m.notice = 0 AND m.state = 'sent' THEN m.created_at END) AS out_at
          FROM messages m JOIN chats c ON c.id = m.chat_id JOIN connections n ON n.id = c.connection_id
          WHERE n.agent_id = ?`,
       )
@@ -1162,13 +1645,26 @@ export class Store {
     const rows = this.db
       .prepare(
         `SELECT m.* FROM messages m JOIN chats c ON c.id = m.chat_id JOIN connections n ON n.id = c.connection_id
-         WHERE n.agent_id = ? AND m.attachments LIKE ?`,
+         WHERE n.agent_id = ? AND m.direction = 'in' AND m.attachments LIKE ?`,
       )
       .all(agentId, `%"id":"${fileId}"%`) as Row[];
     for (const row of rows) {
       const message = toMessage(row);
       const attachment = message.attachments.find((a) => a.id === fileId);
       if (attachment) return { message, chat: this.chat(message.chatId) as Chat, attachment };
+    }
+    return undefined;
+  }
+
+  /** A file in one chat, sent or received, for the console's private chat (docs/spec.md 6.9). */
+  chatFile(chatId: string, fileId: string): { message: Message; attachment: Attachment } | undefined {
+    const rows = this.db
+      .prepare("SELECT * FROM messages WHERE chat_id = ? AND attachments LIKE ?")
+      .all(chatId, `%"id":"${fileId}"%`) as Row[];
+    for (const row of rows) {
+      const message = toMessage(row);
+      const attachment = message.attachments.find((a) => a.id === fileId);
+      if (attachment) return { message, attachment };
     }
     return undefined;
   }
@@ -1195,10 +1691,143 @@ export class Store {
 
   tasks(agentId: string, all: boolean): Task[] {
     const filter = all ? "" : "AND status IN ('todo', 'in_progress')";
-    const rows = this.db
-      .prepare(`SELECT * FROM tasks WHERE agent_id = ? ${filter} ORDER BY created_at`)
-      .all(agentId) as Row[];
+    const rows = this.stmt(`SELECT * FROM tasks WHERE agent_id = ? ${filter} ORDER BY created_at`).all(
+      agentId,
+    ) as Row[];
     return rows.map(toTask);
+  }
+
+  /** A task with a line of its own, started at once or queued (docs/spec.md 4.13). */
+  createLineTask(input: {
+    agentId: string;
+    title: string;
+    fromMessage: string;
+    fromChat: string;
+    brief: string;
+    /** The thread the work happens in from the start: the message was already in one. */
+    threadChat?: string | null;
+  }): Task {
+    const id = this.mint("tasks", "t", 3);
+    const t = this.now();
+    this.db
+      .prepare(
+        "INSERT INTO tasks (id, agent_id, title, status, from_message, from_chat, line_state, brief, thread_chat, created_at, updated_at) VALUES (?, ?, ?, 'in_progress', ?, ?, 'queued', ?, ?, ?, ?)",
+      )
+      .run(
+        id,
+        input.agentId,
+        input.title,
+        input.fromMessage,
+        input.fromChat,
+        input.brief,
+        input.threadChat ?? null,
+        t,
+        t,
+      );
+    return this.task(input.agentId, id) as Task;
+  }
+
+  /** A task by its ID alone, for the line that works on it. */
+  taskById(id: string): Task | undefined {
+    const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Row | undefined;
+    return row && toTask(row);
+  }
+
+  updateLine(
+    id: string,
+    patch: Partial<{
+      lineState: LineState;
+      sessionId: string | null;
+      summary: string;
+      lineError: string | null;
+      threadChat: string;
+      progress: string;
+    }>,
+  ): void {
+    const columns: Record<string, string> = {
+      lineState: "line_state",
+      sessionId: "session_id",
+      summary: "summary",
+      lineError: "line_error",
+      threadChat: "thread_chat",
+      progress: "progress",
+    };
+    const sets: string[] = [];
+    const values: (string | null)[] = [];
+    for (const [key, value] of Object.entries(patch)) {
+      const column = columns[key];
+      if (!column || value === undefined) continue;
+      sets.push(`${column} = ?`);
+      values.push(value);
+    }
+    if (!sets.length) return;
+    this.db.prepare(`UPDATE tasks SET ${sets.join(", ")}, updated_at = ? WHERE id = ?`).run(...values, this.now(), id);
+  }
+
+  /**
+   * The agent's tasks that have a line: those still under way, and those finished in the last day,
+   * for the console's "what it is doing" (docs/spec.md 4.13). Oldest first.
+   */
+  lineTasks(agentId: string, since: number): Task[] {
+    return (
+      this.stmt(
+        `SELECT * FROM tasks WHERE agent_id = ? AND line_state IS NOT NULL
+         AND (line_state IN ('queued', 'running') OR status IN ('todo', 'in_progress') OR updated_at >= ?)
+         ORDER BY created_at`,
+      ).all(agentId, since) as Row[]
+    ).map(toTask);
+  }
+
+  /** Every task whose line has work under way or waiting for a free line, for restarts. */
+  activeLines(agentId?: string): Task[] {
+    const scope = agentId ? "AND agent_id = ?" : "";
+    return (
+      this.db
+        .prepare(`SELECT * FROM tasks WHERE line_state IN ('queued', 'running') ${scope} ORDER BY created_at`)
+        .all(...(agentId ? [agentId] : [])) as Row[]
+    ).map(toTask);
+  }
+
+  /** The line a follow-up belongs to: the task whose line sent `messageId`, or that it was started from. */
+  lineOfMessage(agentId: string, messageId: string): Task | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT t.* FROM tasks t WHERE t.agent_id = ? AND t.line_state IS NOT NULL AND (
+           t.id = (SELECT line_task_id FROM messages WHERE id = ?) OR t.from_message = ?)
+         ORDER BY t.created_at DESC LIMIT 1`,
+      )
+      .get(agentId, messageId, messageId) as Row | undefined;
+    return row && toTask(row);
+  }
+
+  /**
+   * A line still on the work for `messageId`: queued, running or waiting for more. Not one that was
+   * stopped, closed or stopped with an error (that one is started again with a new line).
+   */
+  lineFromMessage(agentId: string, messageId: string): Task | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM tasks WHERE agent_id = ? AND from_message = ? AND line_state IN ('queued', 'running', 'idle')
+           AND status != 'closed' ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(agentId, messageId) as Row | undefined;
+    return row && toTask(row);
+  }
+
+  /** The latest line whose thread this chat is, or that was started in it (docs/spec.md 4.13). */
+  lineOfChat(agentId: string, chatId: string): Task | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM tasks WHERE agent_id = ? AND line_state IS NOT NULL AND (thread_chat = ? OR from_chat = ?) ORDER BY created_at DESC LIMIT 1",
+      )
+      .get(agentId, chatId, chatId) as Row | undefined;
+    return row && toTask(row);
+  }
+
+  /** The line still working for this message that has no thread yet, so a reply to it can open one. */
+  threadlessLine(agentId: string, messageId: string): Task | undefined {
+    const task = this.lineFromMessage(agentId, messageId);
+    return task && !task.threadChat ? task : undefined;
   }
 
   setTaskStatus(agentId: string, id: string, status: TaskStatus): Task | undefined {
@@ -1211,13 +1840,19 @@ export class Store {
   // --------------------------------------------------------------- reminders
 
   createReminder(
-    input: Omit<Reminder, "id" | "createdAt" | "lastFiredAt" | "sourceMessageId"> & { sourceMessageId?: string | null },
+    input: Omit<Reminder, "id" | "createdAt" | "lastFiredAt" | "sourceMessageId" | "check"> & {
+      sourceMessageId?: string | null;
+      /** A reminder that fires on change, with the hash of its first run as the baseline. */
+      check?: { command: string; once: boolean; hash: string; until: number | null } | null;
+    },
   ): Reminder {
     const id = this.mint("reminders", "r", 3);
+    const check = input.check ?? null;
     this.db
       .prepare(
-        `INSERT INTO reminders (id, agent_id, body, rule, timezone, chat_id, source_message_id, next_fire_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO reminders (id, agent_id, body, rule, timezone, chat_id, source_message_id, next_fire_at, created_at,
+           check_command, check_once, check_hash, last_checked_at, check_until)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1229,6 +1864,11 @@ export class Store {
         input.sourceMessageId ?? null,
         input.nextFireAt,
         this.now(),
+        check?.command ?? null,
+        check?.once ? 1 : 0,
+        check?.hash ?? null,
+        check ? this.now() : null,
+        check?.until ?? null,
       );
     return this.reminder(input.agentId, id) as Reminder;
   }
@@ -1242,26 +1882,65 @@ export class Store {
   }
 
   reminders(agentId: string): Reminder[] {
-    const rows = this.db
-      .prepare("SELECT * FROM reminders WHERE agent_id = ? AND next_fire_at IS NOT NULL ORDER BY next_fire_at")
-      .all(agentId) as Row[];
+    const rows = this.stmt(
+      "SELECT * FROM reminders WHERE agent_id = ? AND next_fire_at IS NOT NULL ORDER BY next_fire_at",
+    ).all(agentId) as Row[];
     return rows.map(toReminder);
   }
 
-  /** Reminders that are due, except a paused agent's: they wait and fire once it resumes. */
+  /**
+   * Reminders that are due, except a paused agent's: they wait and fire once it resumes. A check
+   * whose time ran out is due at its deadline even when its next poll is later, so it ends on time.
+   */
   dueReminders(at: number): Reminder[] {
-    const rows = this.db
-      .prepare(
-        `SELECT r.* FROM reminders r JOIN agents a ON a.id = r.agent_id
-         WHERE r.next_fire_at IS NOT NULL AND r.next_fire_at <= ? AND a.status != 'paused' ORDER BY r.next_fire_at`,
-      )
-      .all(at) as Row[];
+    const rows = this.stmt(
+      `SELECT r.* FROM reminders r JOIN agents a ON a.id = r.agent_id
+       WHERE r.next_fire_at IS NOT NULL
+         AND (r.next_fire_at <= ? OR (r.check_command IS NOT NULL AND r.check_until IS NOT NULL AND r.check_until <= ?))
+         AND a.status != 'paused' ORDER BY r.next_fire_at`,
+    ).all(at, at) as Row[];
     return rows.map(toReminder);
   }
 
   /** A reminder fired at `at`; `next` is when it fires again, null for a one-off. */
   markReminderFired(id: string, at: number, next: number | null): void {
     this.db.prepare("UPDATE reminders SET next_fire_at = ?, last_fired_at = ? WHERE id = ?").run(next, at, id);
+  }
+
+  /** A check came due: it runs now and comes due again at `next`. Not a fire: the agent heard nothing. */
+  markReminderDue(id: string, next: number | null): void {
+    this.db.prepare("UPDATE reminders SET next_fire_at = ? WHERE id = ?").run(next, id);
+  }
+
+  /**
+   * A check ran and worked. When its output changed, the new hash becomes the baseline and the
+   * reminder fired at `at`; a `once` check then ends. The output itself is never stored.
+   */
+  recordCheck(id: string, at: number, result: { hash: string; fired: boolean; ended: boolean }): void {
+    if (result.fired) {
+      this.db
+        .prepare(
+          `UPDATE reminders SET check_hash = ?, check_failures = 0, check_error = NULL,
+             last_checked_at = ?, last_fired_at = ?, next_fire_at = CASE WHEN ? THEN NULL ELSE next_fire_at END
+           WHERE id = ?`,
+        )
+        .run(result.hash, at, at, result.ended ? 1 : 0, id);
+    } else {
+      this.db
+        .prepare("UPDATE reminders SET check_failures = 0, check_error = NULL, last_checked_at = ? WHERE id = ?")
+        .run(at, id);
+    }
+  }
+
+  /** A check failed; returns how many times in a row it has now. */
+  recordCheckFailure(id: string, at: number, error: string): number {
+    this.db
+      .prepare(
+        "UPDATE reminders SET check_failures = check_failures + 1, check_error = ?, last_checked_at = ? WHERE id = ?",
+      )
+      .run(error, at, id);
+    const row = this.db.prepare("SELECT check_failures FROM reminders WHERE id = ?").get(id) as Row | undefined;
+    return row ? Number(row.check_failures) : 0;
   }
 
   /** Move the next fire. A recurring reminder goes back to its rule after that one. */
@@ -1310,9 +1989,9 @@ export class Store {
 
   /** Newest first. */
   handoffs(agentId: string, limit: number): Handoff[] {
-    const rows = this.db
-      .prepare("SELECT * FROM handoffs WHERE agent_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?")
-      .all(agentId, limit) as Row[];
+    const rows = this.stmt(
+      "SELECT * FROM handoffs WHERE agent_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+    ).all(agentId, limit) as Row[];
     return rows.map(toHandoff);
   }
 
@@ -1338,6 +2017,45 @@ export class Store {
     const remove = this.db.prepare("DELETE FROM owner_notes WHERE id = ? AND agent_id = ?");
     for (const id of ids) remove.run(id, agentId);
   }
+
+  // ------------------------------------------------------------------- proxy
+
+  proxySettings(): ProxySettings {
+    const row = this.stmt("SELECT * FROM proxy_settings WHERE id = 1").get() as Row | undefined;
+    if (!row) return defaultProxySettings();
+    return {
+      mode: String(row.mode) as ProxyMode,
+      url: str(row.url),
+      hasAuth: Number(row.has_auth) === 1,
+      bypass: String(row.bypass ?? ""),
+      passToHarness: Number(row.pass_to_harness) === 1,
+      updatedAt: Number(row.updated_at ?? 0),
+    };
+  }
+
+  setProxySettings(input: {
+    readonly mode: ProxyMode;
+    readonly url: string | null;
+    readonly hasAuth: boolean;
+    readonly bypass: string;
+    readonly passToHarness: boolean;
+  }): ProxySettings {
+    const now = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO proxy_settings (id, mode, url, has_auth, bypass, pass_to_harness, updated_at)
+         VALUES (1, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           mode = excluded.mode,
+           url = excluded.url,
+           has_auth = excluded.has_auth,
+           bypass = excluded.bypass,
+           pass_to_harness = excluded.pass_to_harness,
+           updated_at = excluded.updated_at`,
+      )
+      .run(input.mode, input.url, input.hasAuth ? 1 : 0, input.bypass, input.passToHarness ? 1 : 0, now);
+    return this.proxySettings();
+  }
 }
 
 const str = (v: SQLInputValue | undefined): string | null => (v === null || v === undefined ? null : String(v));
@@ -1356,6 +2074,8 @@ function toAgent(r: Row): Agent {
     statusFailure: str(r.status_failure),
     hasReplied: Number(r.has_replied) === 1,
     askAll: Number(r.ask_all) === 1,
+    tidy: Number(r.tidy) === 1,
+    chatSeenAt: Number(r.chat_seen_at ?? 0),
     createdAt: Number(r.created_at),
   };
 }
@@ -1400,6 +2120,7 @@ function toContact(r: Row): Contact {
     personId: str(r.person_id),
     personName: str(r.person_name),
     linkedBy: (str(r.linked_by) as LinkedBy | null) ?? null,
+    profile: str(r.profile),
     updatedAt: Number(r.updated_at),
   };
 }
@@ -1414,6 +2135,22 @@ function toPerson(r: Row): Person {
   };
 }
 
+function hearPace(r: Row): HearPace {
+  if (r.hear_pace === "muted") return { kind: "muted" };
+  if (r.hear_pace === "every" && Number(r.hear_every_ms) > 0) return { kind: "every", ms: Number(r.hear_every_ms) };
+  return { kind: "auto" };
+}
+
+function aliases(raw: unknown): string[] {
+  if (typeof raw !== "string") return [];
+  try {
+    const list: unknown = JSON.parse(raw);
+    return Array.isArray(list) ? list.filter((a): a is string => typeof a === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 function toChat(r: Row): Chat {
   return {
     id: String(r.id),
@@ -1423,6 +2160,11 @@ function toChat(r: Row): Chat {
     name: str(r.name),
     parentId: str(r.parent_id),
     access: access(r.access),
+    listen: Number(r.listen ?? 0) === 1,
+    hearPace: hearPace(r),
+    hearTier: r.hear_tier === "save" || r.hear_tier === "balanced" || r.hear_tier === "fast" ? r.hear_tier : null,
+    aliases: aliases(r.aliases),
+    peerId: str(r.peer_id),
   };
 }
 
@@ -1441,6 +2183,8 @@ function toMessage(r: Row): Message {
     state: String(r.state) as Message["state"],
     createdAt: Number(r.created_at),
     retryAt: r.retry_at == null ? null : Number(r.retry_at),
+    ...(r.notice === 1 ? { notice: true } : {}),
+    ...(r.line_task_id ? { lineTaskId: String(r.line_task_id) } : {}),
   };
 }
 
@@ -1452,6 +2196,13 @@ function toTask(r: Row): Task {
     status: String(r.status) as TaskStatus,
     fromMessage: str(r.from_message),
     fromChat: str(r.from_chat),
+    lineState: (str(r.line_state) as LineState | null) ?? null,
+    sessionId: str(r.session_id),
+    brief: str(r.brief),
+    summary: str(r.summary),
+    lineError: str(r.line_error),
+    threadChat: str(r.thread_chat),
+    progress: str(r.progress),
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),
   };
@@ -1469,6 +2220,19 @@ function toReminder(r: Row): Reminder {
     nextFireAt: r.next_fire_at === null ? null : Number(r.next_fire_at),
     lastFiredAt: r.last_fired_at === null || r.last_fired_at === undefined ? null : Number(r.last_fired_at),
     createdAt: Number(r.created_at),
+    check:
+      typeof r.check_command === "string"
+        ? {
+            command: r.check_command,
+            once: Number(r.check_once) === 1,
+            hash: str(r.check_hash),
+            failures: Number(r.check_failures ?? 0),
+            error: str(r.check_error),
+            lastCheckedAt:
+              r.last_checked_at === null || r.last_checked_at === undefined ? null : Number(r.last_checked_at),
+            until: r.check_until === null || r.check_until === undefined ? null : Number(r.check_until),
+          }
+        : null,
   };
 }
 

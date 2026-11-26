@@ -154,7 +154,7 @@ describe("dingtalk connection", () => {
       .map((c) => [c.body.content, c.body.isFinalize]);
     expect(streamed).toEqual([
       ["**正在处理** · 2 秒", false],
-      ['<a atId="staff1">@张三</a> 答案', true],
+      ['<a atId="staff1">张三</a> 答案', true],
     ]);
 
     await connection.send({ chat: { platformId: "staff1", kind: "dm" }, text: "私聊消息" });
@@ -202,6 +202,119 @@ describe("dingtalk connection", () => {
         msgParam: JSON.stringify({ mediaId: "@media2", fileName: "plan.xlsx", fileType: "xlsx" }),
       },
     ]);
+    await connection.close();
+  });
+
+  it("@-mentions people in a group through a recent message's reply address", async () => {
+    const http = fakeHttp({
+      "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }),
+      "/robot/sendBySession": () => ({ errcode: 0 }),
+    });
+    const stream = fakeStream();
+    const received: InboundMessage[] = [];
+    const connection = await dingtalkChannel({
+      api: dingtalkApi(http.fetchImpl),
+      createClient: () => stream.client,
+    }).connect(
+      { clientId: "ding1", clientSecret: "sec", name: "Alex" },
+      { onMessage: (m) => received.push(m), onState: () => {}, onMembership: () => {} },
+    );
+    const group = { platformId: "cid1", kind: "group" as const };
+    const mentions = [{ id: "staff2", name: "李四" }];
+
+    // No message from the group yet: no reply address, so the name goes out as text.
+    expect(await connection.send({ chat: group, text: "@李四 请确认", mentions })).toMatchObject({
+      kind: "sent",
+      degraded: ["mentions_plain"],
+    });
+    expect(http.calls.filter((c) => c.path === "/v1.0/robot/groupMessages/send")).toHaveLength(1);
+
+    // An address outside dingtalk.com is never used.
+    stream.push("cb0", {
+      ...base,
+      msgId: "msg0",
+      conversationType: "2",
+      msgtype: "text",
+      text: { content: "hi" },
+      sessionWebhook: "https://evil.example/robot/sendBySession?session=x",
+      sessionWebhookExpiredTime: Date.now() + 3_600_000,
+    });
+    stream.push("cb1", {
+      ...base,
+      conversationType: "2",
+      msgtype: "text",
+      text: { content: "hi" },
+      sessionWebhook: "https://oapi.dingtalk.com/robot/sendBySession?session=abc",
+      sessionWebhookExpiredTime: Date.now() + 3_600_000,
+    });
+    await until(() => received.length === 2, 1000);
+
+    expect(await connection.send({ chat: group, text: "@李四 请确认，`@李四` 不算", mentions })).toEqual({
+      kind: "sent",
+      platformId: expect.any(String),
+      degraded: [],
+    });
+    const viaSession = http.calls.filter((c) => c.path === "/robot/sendBySession");
+    expect(viaSession).toHaveLength(1);
+    expect(viaSession[0]?.url.hostname).toBe("oapi.dingtalk.com");
+    expect(viaSession[0]?.body).toEqual({
+      msgtype: "markdown",
+      markdown: { title: "@李四 请确认，`@李四` 不算", text: "@staff2 请确认，`@李四` 不算" },
+      at: { atUserIds: ["staff2"], isAtAll: false },
+    });
+
+    // Without mentions, or in a direct chat, the robot API is used as before.
+    await connection.send({ chat: group, text: "普通消息" });
+    await connection.send({ chat: { platformId: "staff2", kind: "dm" }, text: "@李四 你好", mentions });
+    expect(http.calls.filter((c) => c.path === "/robot/sendBySession")).toHaveLength(1);
+    expect(http.calls.filter((c) => c.path === "/v1.0/robot/groupMessages/send")).toHaveLength(2);
+    expect(http.calls.filter((c) => c.path === "/v1.0/robot/oToMessages/batchSend")).toHaveLength(1);
+
+    // A live card only @-mentions the asker; anyone else named in the answer is reported as plain.
+    const live = await connection.startLive?.(group, { replyTo: "msg1", initial: "…" });
+    expect(await live?.finish("@张三 好的", [{ id: "staff1", name: "张三" }])).toEqual({
+      kind: "sent",
+      platformId: expect.any(String),
+    });
+    const live2 = await connection.startLive?.(group, { replyTo: "msg1", initial: "…" });
+    expect(await live2?.finish("问问 @李四", mentions)).toMatchObject({ degraded: ["mentions_plain"] });
+    await connection.close();
+  });
+
+  it("sends plainly when DingTalk turns the reply address down", async () => {
+    const http = fakeHttp({
+      "/v1.0/oauth2/accessToken": () => ({ accessToken: "tok", expireIn: 7200 }),
+      "/robot/sendBySession": () => ({ errcode: 300001, errmsg: "session expired" }),
+    });
+    const stream = fakeStream();
+    const received: InboundMessage[] = [];
+    const connection = await dingtalkChannel({
+      api: dingtalkApi(http.fetchImpl),
+      createClient: () => stream.client,
+    }).connect(
+      { clientId: "ding1", clientSecret: "sec", name: "Alex" },
+      { onMessage: (m) => received.push(m), onState: () => {}, onMembership: () => {} },
+    );
+    stream.push("cb1", {
+      ...base,
+      conversationType: "2",
+      msgtype: "text",
+      text: { content: "hi" },
+      sessionWebhook: "https://oapi.dingtalk.com/robot/sendBySession?session=abc",
+      sessionWebhookExpiredTime: Date.now() + 3_600_000,
+    });
+    await until(() => received.length === 1, 1000);
+    const send = () =>
+      connection.send({
+        chat: { platformId: "cid1", kind: "group" },
+        text: "@李四 在吗",
+        mentions: [{ id: "staff2", name: "李四" }],
+      });
+    expect(await send()).toMatchObject({ kind: "sent", degraded: ["mentions_plain"] });
+    // The refused address is dropped, not tried again.
+    expect(await send()).toMatchObject({ kind: "sent", degraded: ["mentions_plain"] });
+    expect(http.calls.filter((c) => c.path === "/robot/sendBySession")).toHaveLength(1);
+    expect(http.calls.filter((c) => c.path === "/v1.0/robot/groupMessages/send")).toHaveLength(2);
     await connection.close();
   });
 });

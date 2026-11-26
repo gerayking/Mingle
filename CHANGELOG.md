@@ -3,6 +3,145 @@
 Each version's section is its release notes, and what the update window shows.
 Releases are cut as described in [docs/releasing.md](docs/releasing.md).
 
+## 0.4.12
+
+- @-mentions in DingTalk group messages now actually notify the people mentioned, and live replies no longer start with a doubled `@@name`.
+- Fixed creating a Slack app from Mingle's prefilled manifest, which Slack had been rejecting since the `/stop` command was added.
+- Long harness lists in **Settings** and **New Agent** are now collapsed, keeping the page tidy.
+
+## 0.4.11
+
+- Added global network proxy support in **Settings → Network** (and `mingle proxy`): automatic OS proxy detection, manual HTTP/HTTPS/SOCKS5 configuration with credentials kept in the system Keychain, built-in connection testing, optional proxy env forwarding to harnesses, and a quick link to proxy settings when a chat app hits a network error.
+- Drag and drop agents in the sidebar to set your preferred order across both local and remote SSH agents; the order persists across restarts and carries over to `⌘1–⌘9` shortcuts and the desktop menu bar tray.
+- Fixed a Feishu onboarding crash right after QR app creation that could restart Mingle before saving the new bot's credentials.
+
+## 0.4.10
+
+- Tasks and reminders in the work panel now show status dots, the last checked time for check reminders, and inline error details when a check fails.
+- The console feels snappier and uses less background polling: typing in Chat no longer re-renders the message list, pages prefetch as you move to them, and unchanged views skip redundant work.
+- Fixed Grok agents closing a parallel task early while a background command or monitor is still running, so the task stays open until the result comes back.
+- Fixed several bugs across threads, private chat, remote SSH, and group conversations: long-task threads now open reliably on Feishu and Discord, remote SSH agents preserve filenames and raw bytes for private chat uploads and downloads (including JSON and binary files), Chat pagination no longer breaks around notices, and Markdown code fences with extended language tags or nested backticks render cleanly.
+
+## 0.4.9
+
+- Chat with your agent right in the Mingle app: open its new Chat tab. It is the same agent with the same memory as in your chat apps, and it works before any chat app is connected. Replies render with formatting, and files go both ways: drop, paste or attach them, and open what the agent sends in Finder.
+- When an agent writes to you there while you are elsewhere (a reminder, a finished task), the sidebar marks it and the desktop app sends a notification that opens the chat.
+
+## 0.4.8
+
+- Fixed messages that arrived while your agent was still working on a reply sometimes being lost after the agent restarted. They now stay queued and reach it once it is back.
+
+## 0.4.7
+
+- In groups where your agent hears everything, it now keeps up with a conversation: once someone is talking with it, what they say next reaches it as soon as they finish, without an @mention and without the old two-minute wait. Other chatter still waits for it at the usual pace.
+- Calling the agent by name in a group counts as calling it. Add other names the group uses for it (like a nickname) in the console under the group, or let the agent add them itself.
+- Choose how quickly the agent keeps up in each group: Save, Balanced or Fast. Small groups start on Fast, busier ones on Balanced. It only spends more when it looks and has nothing to say.
+- A message someone adds while the agent is still working on their request goes straight into that work, and the agent is nudged to reply in short messages, starting with a quick line before longer work.
+- Fixed messages sent while the agent was replying in a group sometimes never reaching it.
+
+## 0.4.6
+
+- On Feishu, Slack, and Discord, your agent can keep a long task's questions and progress in a thread. Reply there without another @mention to add details or ask it to stop. The result comes back to the group chat.
+- The agent's task list shows the latest progress even on chat apps without threads. Closing a task now stops the work, and the same message no longer starts duplicate tasks.
+- Long tasks start with the request and the messages just before it, so the agent can pick up the context without asking you to repeat it.
+
+## 0.4.5
+
+- Your agent now hears what is said in the groups it is allowed in — including groups it was already in — wherever the chat app delivers those messages, not only when someone @-mentions it. You can turn this off for any conversation.
+- Busy groups taper off on their own: when the agent has nothing to add, it hears from the group less and less often. The agent can also choose to hear a group at most once a week, or stay out of ordinary chatter until someone speaks to it directly.
+
+## 0.4.4
+
+- @mention your agent in a Feishu document comment and it can answer in the same thread. For an existing bot, open its Feishu permissions and scan again to enable Document comments.
+- On Windows, Mingle now clears stale web caches after an update to prevent a blank window, without clearing cookies, local storage, or preferences.
+
+## 0.4.3
+
+- Making a new agent when you already have one? The New agent page now reminds you that one agent can join all your chat apps and work on several things at once. If you have exactly one agent, it links straight to connecting it to another chat app.
+
+## 0.4.2
+
+- Agents hand off code changes, investigations, and long commands more reliably, so they stay available to answer chat messages while the work runs.
+- Fixed a case where a parallel task could get stuck after Claude Code moved a long command into the background. The task now stays open so Claude Code can finish and reply.
+
+## 0.4.1
+
+- An agent can now do several things at once. When something will take a while — writing code, longer research, long commands — it starts that work on the side and stays free to answer everyone else. When the work is done, the agent answers under the message that asked for it.
+- Replying to that answer, or writing in the same thread, goes straight back to the same piece of work, even days later. Nothing to set up: up to three things run at once, and the rest wait their turn.
+- See what your agent is doing in the activity: each piece of work shows where it came from, how long it has been running, and its result when done. Stop one there, or everything with Stop or `/stop`.
+- Teams are gone. Agents that were members are now agents of their own and keep their chat apps; unfinished work given to them goes back to the agent that gave it.
+- Work that a restart of Mingle interrupted now carries on by itself.
+
+## 0.4.0
+
+- An agent can lead a team. In an agent's Settings → Team, add other agents on this computer as members, or create a new agent straight into the team. The lead keeps talking with people and stays quick to answer; work that takes a while — writing code, longer research, long commands — goes to a member with `mingle task create --to`, and the lead reports the result back in the original chat. Members don't need a chat app of their own.
+- The lead and each member share a private chat that never leaves your computer. It shows in the activity with a team mark, and the sidebar shows members under their lead. One level, one team per agent, and only you can change who is in a team.
+- If two agents go back and forth 20 times with no person speaking, Mingle pauses their chat and asks you in "Needs you"; one click lets them go on. Nothing they sent is lost, even across a restart.
+- Once a day, an idle agent gets a quiet turn to tidy its memory: it brings `MEMORY.md` and `notes/` up to date, marks finished work finished and drops what is out of date, without sending anything to chats. Turn it off in Settings → Running.
+
+## 0.3.3
+
+- Mingle can now use Devin and Factory Droid to run your agents. Install and sign in to either CLI on the machine where your agent runs, then choose it as the agent's brain in Mingle.
+
+## 0.3.2
+
+- Ask your agent to watch a pull request's checks, a page, or a new release. Mingle runs the check on your machine without using model quota for each poll. A change wakes the agent, and a check that's no longer needed can be cancelled from the console.
+- Checks stop when cancelled and respect their deadline even when snoozed. Check commands no longer inherit the agent's configured credentials, and raw check output is no longer kept in reminder history.
+- Long-running chat replies finish more reliably. Feishu keeps updating the original card where possible; when a platform's live reply window closes, Mingle can send the answer as a new message.
+- If a harness refuses to resume a saved session, Mingle can start a fresh session instead of getting stuck on the same error.
+
+## 0.3.1
+
+- An agent can hand a conversation to another agent in a group: when its answer names someone as `@name` — a person, a bot, or the platform name — Mingle writes the platform's real mention on Feishu, Slack, Discord, Telegram and GitHub, so the other side is actually woken. Mentioning two agents together now gets them talking to each other. After `reply`/`send`, the agent sees who was mentioned and which @words matched nobody, and two agents mentioned together learn each other's name.
+- A group can listen to everything: a "Hear every message here" switch on the conversation in the activity makes the bot take in all messages where the chat app sends them (Feishu, Slack, Discord, Telegram). What people say is gathered into one input after a stretch of quiet — no live reply and nothing marked unanswered; the agent speaks up only when it has something to add, and an @ still reaches it at once.
+- Threads keep listening without an @: once the agent has spoken in a Discord thread, what people say next wakes it, as Slack threads already did.
+- A reply now says what it answers: the agent sees `> name: …` above the reply text (clipped to 200 characters), so a bare "approved" makes sense without reading back.
+- Mingle's own lines — a new bot's greeting to its owner, the "let me check with my owner" answer to a stranger, claim confirmations — are kept with their chat and shown in the activity instead of going unrecorded.
+
+## 0.3.0
+
+- An agent no longer stays "working" forever on a command that never ends. When a turn reports nothing at all — no thinking, text, tool call, subagent or background-task update, and no `mingle` command from the agent — for twenty minutes while a message is waiting on it, Mingle stops the turn on its own rather than counting it an owner stop: the harness gets thirty seconds to end it before its process is replaced and the conversation continues in a new one. Messages sent while it was stuck are then answered in a fresh turn, or shown as "No reply yet", instead of disappearing into the stuck turn — the status no longer sits on a tool name and the owner no longer has to reset the agent by hand.
+- A long job the agent took on after acknowledging a message is left alone: a quiet turn nobody is waiting on is not stopped. Mingle checks it again every minute and steps in only once a new message arrives and goes unanswered.
+
+## 0.2.4
+
+- An agent no longer stays "working" forever on a command that never ends. When a turn reports nothing at all — no thinking, text, tool call, subagent or background-task update — for twenty minutes, Mingle stops the turn on its own rather than counting it an owner stop: the harness gets thirty seconds to end it before its process is replaced and the conversation continues in a new one. Messages sent while it was stuck are then answered in a fresh turn, or shown as "No reply yet", instead of disappearing into the stuck turn — the status no longer sits on a tool name and the owner no longer has to reset the agent by hand.
+
+## 0.2.3
+
+- A message is no longer written off a second after it was sent when the agent's harness acknowledged it without running it. Kimi Code answers a prompt queued behind its own background task instantly with an empty turn, and Mingle used to take that as the agent staying silent — it reminded once, got the same instant empty answer, and marked the message unanswered, all before the model ever saw it. Such a turn now counts as no turn at all: the message waits for the turn that really runs it, is checked again after ten minutes or the next real turn, and the agent's late answer still settles it. A message a harness without steer queued for its next turn is likewise not reminded about until a turn has run on it.
+- "This message did not get a reply" no longer appears when the agent did answer — by quoting another message in the same chat, or by answering after the reminder was already queued. The line now reads "No reply yet." so it stays true when a late answer arrives, and the reminder is re-checked at delivery so the agent never sees one for messages it already answered.
+
+## 0.2.2
+
+- The activity on an agent's page is now grouped by conversation instead of one timeline. Each chat gets a row, newest first; a closed row shows the last question and the agent's answer, and opening it reads the latest six messages in place with a link for earlier ones — the newest conversation starts open, and ↑↓ / → / ← move, open and close rows like a Mac list. Threads a platform attaches to a channel (Slack today) nest under that channel. What still needs you — messages that failed, went unanswered or wait for your approval — is marked right on the row and comes back however old, so a busy group can no longer push an unanswered request out of view. Discord threads and Telegram topics still show as their own rows for now.
+- A bot's permission page can turn everything on with one scan. When more than one permission is off, a "Turn all on" action grants them all at once instead of scanning once per row. The two group-message permissions are also named by sender — what people send vs. what other bots send — so the pair no longer looks redundant.
+- Agents are now told plainly to talk only through Mingle: a chat app's own CLI, MCP server or skill must not be used to send, reply or react, even when it offers to. Two Feishu agents had written to colleagues through a CLI signed in as a different real account, so people heard that account rather than the agents.
+
+## 0.2.1
+
+- Two Feishu bots in one group both hear a message that @-mentions them now. The Feishu SDK skipped a message ID it had already delivered, and all bots in one process shared that check — so when a person @-ed two agents at once, only the first to see it got the message and the other stayed silent. Each connection now keeps its own duplicate check. Verified on a real Feishu group: eight messages @-ing one or both bots all reached the right agent.
+- Feishu agents can see what other bots say in their groups. Feishu never pushed another bot's messages before; the bot's app now asks for that when it is created, and a bot connected earlier can add it from the Permissions section on its page — one re-scan of the same code brings the grant onto the existing app. Other bots' messages arrive as background, marked as bots, so they never wake the agent unless they explicitly @ it, and the existing five-reply brake between bots still applies.
+- Agents remember the bots in their groups, not only the people. Feishu's member list leaves bots out, so the agent also reads the group's bot list — other agents and bots appear in `contact list` and `chat info` with a `bot` mark, ready to be @-ed. The owner's contacts page no longer fills up with a large group's member list: it shows people who wrote to the agent or were decided about, while the full roster stays in the agent's own address book.
+- A bot's page can show where someone sits in the organization. The Permissions section is now a row per permission — what it gives the agent, and either "On" or a button to turn it on in place. On Feishu, "Member profiles" asks for department and title only (never email or phone); once on, a person's line such as "Product · Product manager" shows in the agent's first greeting card, `contact list`, and the console.
+- An agent can message a person directly even before that person has ever written to it.
+
+## 0.2.0
+
+- Agents can now run on your own SSH host, not only on this computer. Until now an agent stopped receiving and replying the moment this computer slept or Mingle quit, because everything — its harness, chat connections, credentials, data and reminders — lived here. A remote agent keeps all of that on your host: it stays online and keeps working while this computer is off, and the console manages it over SSH. This computer stays the default run location, and there is still no hosted service — both sides only listen on loopback.
+- Choosing a remote host is part of picking the agent's brain: in the "choose its brain" step, the words "this computer" open a menu listing hosts from your `~/.ssh/config` and an "Add SSH host…" option that expands right there. Mingle then installs a private Node.js runtime and its own service on the host for you — one click, with progress and retry when something fails. While a host is being prepared the location can't be switched, and when a remote agent's host is unreachable — after a reboot, for example — its own page offers "Prepare or reconnect" in place. The agent's header and its Brain settings show which host it runs on. A run location can't be changed after the agent is created.
+- Shortcuts are easier to discover. Buttons with a shortcut now show a small tooltip with its key after a short hover — instantly when moving between buttons — and holding the modifier alone (⌘ on Mac, Ctrl elsewhere) for half a second reveals every shortcut beside its button, the way Windows shows access keys while Alt is held. The agent page gains ⇧⌘[ and ⇧⌘] (Ctrl+Page Up / Ctrl+Page Down, or Ctrl+Tab) to switch tabs and ⌘. to stop a reply.
+
+## 0.1.19
+
+- An installed agent app no longer flickers between "installed" and "not installed". Checking whether a harness such as CodeBuddy is installed launches several probes at once — especially slow on Windows, where each probe starts a `.cmd` shim and Node — and a single timed-out probe used to replace the earlier answer, so the harness picker and the install status in Settings could lose a working harness. Mingle now remembers where each harness was last found, keeps it while the program is still on disk, and only reports "not installed" when the program ran and refused or its file is gone. The picker and Settings also share one probe instead of running their own at the same time, and starting a session trusts the remembered copy, so one missed probe can no longer fail with "not installed".
+
+## 0.1.18
+
+- The console and the desktop app answer the keys each platform already uses — Command on macOS, Ctrl on Windows and Linux. ⌘N / Ctrl+N starts a new agent, ⌘, / Ctrl+, opens settings, and ⌘1–⌘9 / Ctrl+1–9 jumps to that agent in the sidebar. In the app, ⌘[ and ⌘] (Alt+← and Alt+→ on Windows and Linux) go back and forward, ⌘W / Ctrl+W closes the window while Mingle keeps running, and ⌘Q / Ctrl+Q quits, asking first while agents are online. Esc backs out of every in-place question and editor, and ⌘Return / Ctrl+Enter submits a multi-line field. The Mac app gains the standard menu bar — Settings, File, Edit, View and Window — and sidebar buttons show their shortcut on hover.
+- Naming a new agent is quicker: a dice button in the name field suggests a companion name, skipping names your other agents already have, and two role templates join the list — Study buddy and Habit coach, in English and Chinese.
+- The sidebar's brand row drops the logo mark; the wordmark stays and still drags the window.
+
 ## 0.1.17
 
 - iMessage keeps the agent in one thread. Every message to yourself is stored twice, once per address, and the agent used to answer in whichever copy Messages wrote first, so its replies jumped between your email and phone-number threads and both sides of each looked mixed up. It now picks the thread from where you wrote from and to: when you write from your number to your Apple ID, your words stay on the right and the agent's land on the left. Its own reflected copies are never read back as yours, even if the invisible marker is lost.

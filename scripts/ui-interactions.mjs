@@ -12,6 +12,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { REMOTE_MOCK } from "./ui-remote.mjs";
+
 const LOCALES = {
   "en-US": {
     storage: "en",
@@ -75,6 +77,12 @@ const LOCALES = {
     ownerUnnamed: "Owner not named",
     ownerIs: "Owner: ",
     save: "Save",
+    roleTitle: "Role",
+    edit: "Edit",
+    roleSaved: "Saved. It applies from the next message.",
+    navMenu: "Agents and settings",
+    showMore: (n) => `Show ${n} more`,
+    showLess: "Show less",
   },
   "zh-CN": {
     storage: "zh-CN",
@@ -138,6 +146,12 @@ const LOCALES = {
     ownerUnnamed: "owner 未命名",
     ownerIs: "owner：",
     save: "保存",
+    roleTitle: "角色",
+    edit: "编辑",
+    roleSaved: "已保存，从下一条消息起生效。",
+    navMenu: "Agent 与设置",
+    showMore: (n) => `展开其余 ${n} 个`,
+    showLess: "收起",
   },
 };
 
@@ -156,6 +170,17 @@ const INSTALL_MOCK = String.raw`(() => {
       { id: "other-test", name: "Other Test", installed: false, canInstall: true, canSignIn: false },
       { id: "update-test", name: "Update Test", installed: true, version: "1.0.0", canInstall: false, canSignIn: false, canUpdate: true },
     ];
+    if (s.many) {
+      list.push(
+        { id: "extra-1", name: "Extra Installed 1", installed: true, version: "1.0.0", canInstall: false, canSignIn: false },
+        { id: "extra-2", name: "Extra Installed 2", installed: true, version: "1.0.0", canInstall: false, canSignIn: false },
+        { id: "extra-3", name: "Extra Installed 3", installed: true, version: "1.0.0", canInstall: false, canSignIn: false },
+        { id: "extra-4", name: "Extra Installed 4", installed: true, version: "1.0.0", canInstall: false, canSignIn: false },
+        { id: "extra-5", name: "Extra Uninstalled 1", installed: false, canInstall: true, canSignIn: false },
+        { id: "extra-6", name: "Extra Uninstalled 2", installed: false, canInstall: true, canSignIn: false },
+        { id: "extra-7", name: "Extra Uninstalled 3", installed: false, canInstall: true, canSignIn: false },
+      );
+    }
     if (s.job && s.job.state === "running") list[0].installJob = s.job;
     return list;
   };
@@ -173,7 +198,7 @@ const INSTALL_MOCK = String.raw`(() => {
       return Promise.resolve(json({ kind: "unsupported", detail: "not offered here" }));
     if (method === "GET" && path === "/v1/admin/brains/update-test/update")
       return Promise.resolve(json({ kind: "available", installed: "1.0.0", latest: "1.1.0" }));
-    if (method === "GET" && /^\/v1\/admin\/brains\/(install-test|other-test|update-test)\/sign-in$/.test(path))
+    if (method === "GET" && /^\/v1\/admin\/brains\/(install-test|other-test|update-test|extra-\d+)\/(sign-in|update|usage)$/.test(path))
       return Promise.resolve(json({ kind: "unknown" }));
     if (method === "POST" && path === "/v1/admin/brains/install-test/install") {
       const s = read();
@@ -195,6 +220,46 @@ const INSTALL_MOCK = String.raw`(() => {
       const s = read();
       if (s.job && s.job.id === jobMatch[1]) return Promise.resolve(json(s.job));
       return Promise.resolve(json({ error: "job_not_found" }, 404));
+    }
+    return real(input, init);
+  };
+})()`;
+
+// The Feishu bot (n2) as if it were online, with its permissions and a few contacts, while
+// sessionStorage "mingle.permissions-review" is set: the permission rows read the platform
+// live, which this throwaway Mingle has no connection for. Everything else is real.
+const PERMISSIONS_MOCK = String.raw`(() => {
+  const on = () => sessionStorage.getItem("mingle.permissions-review");
+  const json = (payload) => new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } });
+  const real = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const path = typeof input === "string" ? input : input.url;
+    const method = (init && init.method) || "GET";
+    if (!on() || method !== "GET") return real(input, init);
+    if (path === "/v1/admin/connections/n2/permissions")
+      return json({
+        permissions: [
+          { id: "group_messages", granted: on() !== "several" },
+          { id: "bot_messages", granted: true },
+          { id: "member_profiles", granted: on() === "granted", optional: true },
+        ],
+      });
+    if (path === "/v1/admin/status" || /^\/v1\/admin\/agents\/[^/]+\/contacts$/.test(path)) {
+      const body = await (await real(input, init)).json();
+      if (path === "/v1/admin/status") {
+        for (const agent of body.agents)
+          for (const c of agent.connections) if (c.id === "n2") Object.assign(c, { state: "connected", detail: null, owner: "ou_owner" });
+        return json(body);
+      }
+      const account = (id, name, profile, bot) => ({
+        id, platform: "feishu", connection: "n2", name, platformName: name, owner: false, access: null,
+        ownerShared: false, bot, linkedBy: null, profile,
+      });
+      body.push(
+        { person: null, name: "应珊珊", note: null, accounts: [account("uys1", "应珊珊", "KubeBlocks Enterprise 产品部, 平台与基础设施组 · 高级产品经理", false)] },
+        { person: null, name: "Thomas the Coder", note: null, accounts: [account("utc1", "Thomas the Coder", null, true)] },
+      );
+      return json(body);
     }
     return real(input, init);
   };
@@ -308,6 +373,8 @@ export async function reviewInteractions({
     await send("Runtime.enable");
     // The fake-harness mock must exist in every document, full reloads included.
     await send("Page.addScriptToEvaluateOnNewDocument", { source: INSTALL_MOCK });
+    await send("Page.addScriptToEvaluateOnNewDocument", { source: REMOTE_MOCK });
+    await send("Page.addScriptToEvaluateOnNewDocument", { source: PERMISSIONS_MOCK });
 
     // Run a function in the page; page errors and timeouts are real failures.
     const prelude = `const connTriggers=(more)=>[...document.querySelectorAll("button[aria-label]")].filter((b)=>b.getAttribute("aria-label")===more&&!b.closest("header")&&!b.closest("aside")&&b.closest('[id^="connection-"]'));const brainRow=(name)=>{const el=[...document.querySelectorAll("span.font-medium")].find((s)=>s.textContent.trim()===name);return el?el.closest(".divide-y > *"):null;};`;
@@ -331,6 +398,16 @@ export async function reviewInteractions({
         if (value) return value;
         if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
         await sleep(100);
+      }
+    };
+    // Settings sections load on their own; a target measured before they land moves under the click.
+    const settled = async (what, fn, ...args) => {
+      let last = await until(what, fn, ...args);
+      for (;;) {
+        await sleep(250);
+        const now = await until(what, fn, ...args);
+        if (now.x === last.x && now.y === last.y) return now;
+        last = now;
       }
     };
     const click = async (x, y) => {
@@ -456,7 +533,7 @@ export async function reviewInteractions({
     /** Open the i-th bot's page from the settings list; it shows that one bot. */
     const openBot = async (i, labels) => {
       await until("chat app rows", chatAppRows);
-      await clickEl(await until("chat app row", chatAppRowCenter, i));
+      await clickEl(await settled("chat app row", chatAppRowCenter, i));
       await until("bot page", (more) => connTriggers(more).length === 1 || null, labels.more);
     };
     const backToList = async (labels) => {
@@ -1042,6 +1119,79 @@ export async function reviewInteractions({
       }
     }
 
+    // --- Settings Harnesses collapse/expand when there are many harnesses (MING-157) ---
+    const brainsCollapseScenario = async (localeName, labels, width) => {
+      const tag = `brains-collapse ${localeName} ${width}`;
+      await metrics(width);
+      await call(() => {
+        sessionStorage.setItem(
+          "mingle.install-review",
+          JSON.stringify({ job: null, installed: false, starts: 0, many: true }),
+        );
+      });
+      await send("Page.navigate", { url: `${url}/settings#token=${token}` });
+      await until("page load", () => document.readyState === "complete" && !!document.querySelector("header"));
+      await call((locale) => localStorage.setItem("mingle.locale", locale), labels.storage);
+      await send("Page.reload");
+      const toggleCenter = (wanted) => {
+        const btn = [...document.querySelectorAll("button[aria-expanded]")].find(
+          (b) => b.textContent.trim() === wanted,
+        );
+        if (!btn) return null;
+        btn.scrollIntoView({ block: "center" });
+        const r = btn.getBoundingClientRect();
+        return r.width && r.height
+          ? { x: r.left + r.width / 2, y: r.top + r.height / 2, expanded: btn.getAttribute("aria-expanded") }
+          : null;
+      };
+      // 10 harnesses total (5 installed, 5 uninstalled): collapsed shows 4 installed + 6 hidden.
+      const collapsedBtn = await until("collapsed toggle", toggleCenter, labels.showMore(6));
+      assert(collapsedBtn.expanded === "false", `${tag}: aria-expanded should be false while collapsed`);
+      assert(await call(rowHas, "Update Test", "1.0.0"), `${tag}: first installed harness missing`);
+      assert(!(await call(rowHas, "Extra Installed 4", "1.0.0")), `${tag}: 5th installed harness should be folded`);
+      assert(!(await call(rowHas, "Other Test", labels.notInstalled)), `${tag}: uninstalled harness should be folded`);
+      assert(await call(pageFits), `${tag}: horizontal overflow while collapsed`);
+      await shot(`${localeName}-${width}-brains-collapsed`);
+
+      // Expand reveals all 10 harnesses and flips toggle to "Show less".
+      await clickEl(collapsedBtn);
+      const expandedBtn = await until("expanded toggle", toggleCenter, labels.showLess);
+      assert(expandedBtn.expanded === "true", `${tag}: aria-expanded should be true while expanded`);
+      await until("extra installed visible", rowHas, "Extra Installed 4", "1.0.0");
+      await until("other test visible", rowHas, "Other Test", labels.notInstalled);
+      assert(await call(pageFits), `${tag}: horizontal overflow while expanded`);
+      await shot(`${localeName}-${width}-brains-expanded`);
+
+      // Collapse hides the overflow rows again.
+      await clickEl(expandedBtn);
+      await until("re-collapsed toggle", toggleCenter, labels.showMore(6));
+      assert(!(await call(rowHas, "Other Test", labels.notInstalled)), `${tag}: uninstalled harness still visible`);
+
+      // A running install on an otherwise-hidden harness stays visible even after reload.
+      await call(() => {
+        sessionStorage.setItem(
+          "mingle.install-review",
+          JSON.stringify({
+            job: { id: "j-install-test", kind: "install", harness: "install-test", state: "running", events: [] },
+            installed: false,
+            starts: 1,
+            many: true,
+          }),
+        );
+      });
+      await send("Page.reload");
+      await until("running install stays visible", rowHas, "Install Test", labels.installing);
+      await until("collapsed count accounts for pinned row", toggleCenter, labels.showMore(5));
+      await resetFixture();
+    };
+    for (const [localeName, labels] of Object.entries(LOCALES)) {
+      for (const width of [1440, 560]) {
+        await brainsCollapseScenario(localeName, labels, width);
+        passed++;
+        console.log(`brains-collapse ${localeName} ${width}: passed`);
+      }
+    }
+
     // --- pause and resume from the agent's Settings, and back from the card ---
     const buttonByText = (wanted) => {
       const el = [...document.querySelectorAll("main button, button")].find((b) => b.textContent.trim() === wanted);
@@ -1049,16 +1199,6 @@ export async function reviewInteractions({
       el.scrollIntoView({ block: "center" });
       const r = el.getBoundingClientRect();
       return r.width && r.height ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
-    };
-    // Settings sections load on their own; a target measured before they land moves under the click.
-    const settled = async (what, fn, ...args) => {
-      let last = await until(what, fn, ...args);
-      for (;;) {
-        await sleep(250);
-        const now = await until(what, fn, ...args);
-        if (now.x === last.x && now.y === last.y) return now;
-        last = now;
-      }
     };
     const pauseScenario = async (localeName, labels, width) => {
       const tag = `pause ${localeName} ${width}`;
@@ -1295,6 +1435,156 @@ export async function reviewInteractions({
       }
     }
 
+    // --- keyboard shortcuts: Command on macOS, Ctrl elsewhere (MING-93) ---
+    const modifier = await call(() => (/Mac|iPhone|iPad/.test(navigator.userAgent) ? 4 : 2));
+    const press = async (k, code, vk, modifiers = 0) => {
+      for (const type of ["keyDown", "keyUp"]) {
+        await send("Input.dispatchKeyEvent", { type, key: k, code, windowsVirtualKeyCode: vk, modifiers });
+      }
+    };
+    const path = () => location.pathname;
+    const shortcutScenario = async (localeName, labels, width) => {
+      const tag = `shortcuts ${localeName} ${width}`;
+      await metrics(width);
+      await goto(`/a/${slug}`, labels);
+      await press(",", "Comma", 188, modifier);
+      await until("settings by shortcut", () => location.pathname === "/settings");
+      await press("n", "KeyN", 78, modifier);
+      await until("new agent by shortcut", () => location.pathname === "/new");
+      await press("1", "Digit1", 49, modifier);
+      await until("first agent by shortcut", () => location.pathname.startsWith("/a/"));
+      const first = await call(path);
+      await press("2", "Digit2", 50, modifier);
+      await until(
+        "second agent by shortcut",
+        (p) => location.pathname.startsWith("/a/") && location.pathname !== p,
+        first,
+      );
+
+      // The agent's tabs: ⇧⌘[ ⇧⌘] on macOS, Ctrl+Page Up / Down elsewhere.
+      await goto(`/a/${slug}`, labels);
+      const tabChecked = (label) =>
+        [...document.querySelectorAll('header [role="radio"]')].some(
+          (b) => b.textContent.trim() === label && b.getAttribute("aria-checked") === "true",
+        );
+      if (modifier === 4) await press("}", "BracketRight", 221, modifier | 8);
+      else await press("PageDown", "PageDown", 34, modifier);
+      await until("settings tab by shortcut", tabChecked, labels.settings);
+      if (modifier === 4) await press("{", "BracketLeft", 219, modifier | 8);
+      else await press("PageUp", "PageUp", 33, modifier);
+      await until("activity tab by shortcut", tabChecked, labels.activity);
+
+      // Holding the modifier alone shows every shortcut beside its button; letting go hides them.
+      const hintsShown = () => {
+        const badges = [...document.querySelectorAll("span[aria-hidden] > kbd")].map((k) => k.parentElement);
+        const shown = badges.filter((b) => b.offsetParent && getComputedStyle(b).opacity === "1");
+        return badges.length > 0 && shown.length === badges.filter((b) => b.offsetParent).length ? shown.length : 0;
+      };
+      const hintsHidden = () =>
+        [...document.querySelectorAll("span[aria-hidden] > kbd")].every(
+          (k) => getComputedStyle(k.parentElement).opacity === "0",
+        );
+      const modKey = modifier === 4 ? ["Meta", "MetaLeft", 91] : ["Control", "ControlLeft", 17];
+      await send("Input.dispatchKeyEvent", {
+        type: "rawKeyDown",
+        key: modKey[0],
+        code: modKey[1],
+        windowsVirtualKeyCode: modKey[2],
+        modifiers: modifier,
+      });
+      await sleep(200);
+      assert(await call(hintsHidden), `${tag}: hints showed before the hold delay`);
+      const shown = await until("hints while held", hintsShown);
+      // Two tabs, at least two agents, New agent and Settings.
+      assert(shown >= (width < 768 ? 2 : 6), `${tag}: only ${shown} hints`);
+      assert(await call(pageFits), `${tag}: horizontal overflow with hints`);
+      await shot(`${localeName}-${width}-shortcut-hints`);
+      await send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: modKey[0],
+        code: modKey[1],
+        windowsVirtualKeyCode: modKey[2],
+      });
+      await until("hints hidden on release", hintsHidden);
+
+      if (width >= 768) {
+        // Pointing at a sidebar row shows its name and keys, soon.
+        const rowAt = await call(() => {
+          const el = document.querySelector("aside nav button");
+          const r = el?.getBoundingClientRect();
+          return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+        });
+        await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: rowAt.x, y: rowAt.y });
+        const started = Date.now();
+        await until("tooltip", () => !!document.querySelector('[role="tooltip"] kbd'));
+        assert(Date.now() - started < 1500, `${tag}: tooltip took ${Date.now() - started} ms`);
+        await shot(`${localeName}-${width}-shortcut-tooltip`);
+        await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: width - 4, y: 880 });
+        await until("tooltip gone", () => !document.querySelector('[role="tooltip"]'));
+      }
+
+      // Command-Return saves the role; Escape leaves the editor without saving.
+      await goto(`/a/${slug}`, labels);
+      await clickEl(await call(centerOfText, "header", '[role="radio"]', labels.settings));
+      await clickEl(await settled("edit role", handoffButton, labels.roleTitle, labels.edit));
+      await until("role editor", () => document.activeElement?.tagName === "TEXTAREA");
+      const role = `Plans weekend hikes (${tag})`;
+      await call(() => {
+        const el = document.activeElement;
+        el.select();
+      });
+      await send("Input.insertText", { text: role });
+      await press("Enter", "Enter", 13, modifier);
+      await until("role saved", (saved) => document.body.textContent.includes(saved), labels.roleSaved);
+      assert(!(await call(() => !!document.querySelector("textarea"))), `${tag}: editor still open after save`);
+      await until("role shown", (r) => document.body.textContent.includes(r), role);
+      await clickEl(await settled("edit role again", handoffButton, labels.roleTitle, labels.edit));
+      await until("role editor again", () => document.activeElement?.tagName === "TEXTAREA");
+      await send("Input.insertText", { text: " (discarded)" });
+      await press("Escape", "Escape", 27);
+      await until("editor closed by Escape", () => !document.querySelector("textarea"));
+      assert(
+        await call(
+          (r) => document.body.textContent.includes(r) && !document.body.textContent.includes("(discarded)"),
+          role,
+        ),
+        `${tag}: Escape kept the draft`,
+      );
+
+      // Escape closes the handoff panel.
+      await clickEl(await settled("handoff button", handoffButton, labels.handoffTitle, labels.handoffOpen));
+      await clickEl(await settled("paste tab", handoffButton, labels.handoffTitle, labels.handoffPaste));
+      await until("paste box", () => document.activeElement?.tagName === "TEXTAREA");
+      await press("Escape", "Escape", 27);
+      await until("handoff closed by Escape", () => !document.querySelector("textarea"));
+      await settled("handoff button back", handoffButton, labels.handoffTitle, labels.handoffOpen);
+
+      if (width < 768) {
+        // Escape closes the sidebar opened over the page.
+        await clickEl(
+          await until(
+            "menu button",
+            (label) => {
+              const el = document.querySelector(`button[aria-label="${label}"]`);
+              const r = el?.getBoundingClientRect();
+              return r?.width ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+            },
+            labels.navMenu,
+          ),
+        );
+        await until("drawer open", () => !!document.querySelector("div.fixed.inset-0"));
+        await press("Escape", "Escape", 27);
+        await until("drawer closed by Escape", () => !document.querySelector("div.fixed.inset-0"));
+      }
+      assert(await call(pageFits), `${tag}: horizontal overflow`);
+    };
+    await shortcutScenario("en-US", LOCALES["en-US"], 1440);
+    passed++;
+    console.log("shortcuts en-US 1440: passed");
+    await shortcutScenario("zh-CN", LOCALES["zh-CN"], 560);
+    passed++;
+    console.log("shortcuts zh-CN 560: passed");
+
     // --- one agent on two WeChat accounts: name the second owner under Contacts (MING-55, MING-80) ---
     const ownerScenario = async (localeName, labels, width) => {
       const tag = `owner ${localeName} ${width}`;
@@ -1461,14 +1751,18 @@ export async function reviewInteractions({
       const reply = (path, mode) =>
         new Response(
           JSON.stringify(
-            mode === "fail" ? { error: "http_error" } : path.includes("/activity") ? [] : { tasks: [], reminders: [] },
+            mode === "fail"
+              ? { error: "http_error" }
+              : path.includes("/conversations")
+                ? []
+                : { tasks: [], reminders: [] },
           ),
           { status: mode === "fail" ? 500 : 200, headers: { "content-type": "application/json" } },
         );
       window.fetch = (input, init) => {
         const path = typeof input === "string" ? input : input.url;
         const method = init?.method || "GET";
-        if (method === "GET" && /\/v1\/admin\/agents\/[^/]+\/(activity|work)(\?|$)/.test(path)) {
+        if (method === "GET" && /\/v1\/admin\/agents\/[^/]+\/(conversations|work)(\?|$)/.test(path)) {
           state.calls.push(path);
           if (state.mode === "hold") return new Promise((resolve) => state.pending.push({ path, resolve }));
           return Promise.resolve(reply(path, state.mode));
@@ -1675,7 +1969,7 @@ export async function reviewInteractions({
       // The activity row holding this exact message body; runs inside the page.
       const buttonInRow = (text, wanted) => {
         const body = [...document.querySelectorAll("p")].find((p) => p.textContent.trim() === text);
-        const row = body?.closest("div.px-4");
+        const row = body?.closest("[data-message]");
         const el = [...(row?.querySelectorAll("button") ?? [])].find((b) => b.textContent.trim() === wanted);
         if (!el) return null;
         el.scrollIntoView({ block: "center" });
@@ -1700,7 +1994,7 @@ export async function reviewInteractions({
         "row shows ignored",
         (text, ignored, retryMsg, ignore) => {
           const body = [...document.querySelectorAll("p")].find((p) => p.textContent.trim() === text);
-          const row = body?.closest("div.px-4");
+          const row = body?.closest("[data-message]");
           if (!row?.textContent.includes(ignored)) return false;
           const buttons = [...row.querySelectorAll("button")].map((b) => b.textContent.trim());
           return !buttons.includes(retryMsg) && !buttons.includes(ignore);
@@ -1719,7 +2013,7 @@ export async function reviewInteractions({
         "ignored survives reload",
         (text, ignored) => {
           const body = [...document.querySelectorAll("p")].find((p) => p.textContent.trim() === text);
-          return body?.closest("div.px-4")?.textContent.includes(ignored) ?? false;
+          return body?.closest("[data-message]")?.textContent.includes(ignored) ?? false;
         },
         bodyText,
         labels.ignored,
@@ -1755,6 +2049,397 @@ export async function reviewInteractions({
     );
     passed++;
     console.log("ignore zh-CN 1440: passed");
+    // Remote creation, local-only host preparation errors, and stale-state presentation.
+    for (const [localeName, labels] of Object.entries(LOCALES)) {
+      const zh = localeName === "zh-CN";
+      for (const width of [1024, 560]) {
+        await metrics(width, 1600);
+        await call(() => sessionStorage.setItem("mingle.ssh-review", "online"));
+        await goto(`/a/ssh_0123456789ab~remote-review`, labels);
+        await until("remote location", () =>
+          document.body.textContent.includes("developer@remote-development-machine.example"),
+        );
+        assert(await call(pageFits), "remote status overflows");
+        await shot(`${localeName}-${width}-ssh-online`);
+        await spaNav("/new");
+        // Running elsewhere is a word in the brain step's hint, not a field above the form.
+        await until(
+          "location word",
+          (label) => !!document.querySelector(`main button[aria-label="${label}"]`),
+          zh ? "运行位置" : "Run on",
+        );
+        // The chosen brain's model picker is a legitimate select here; only the SSH
+        // form's own controls may not take room before the location menu is opened.
+        assert(
+          await call(
+            (model) =>
+              [...document.querySelectorAll("main select")].every((s) => s.getAttribute("aria-label") === model) &&
+              !document.querySelector('input[placeholder="user@host"]'),
+            zh ? "模型" : "Model",
+          ),
+          "location takes room before it is opened",
+        );
+        await shot(`${localeName}-${width}-ssh-local`);
+        await clickEl(
+          await call(
+            (label) => {
+              const r = document.querySelector(`main button[aria-label="${label}"]`).getBoundingClientRect();
+              return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+            },
+            zh ? "运行位置" : "Run on",
+          ),
+        );
+        await until("location menu", () => document.querySelectorAll('[role="menuitemradio"]').length === 3);
+        await shot(`${localeName}-${width}-ssh-menu`);
+        await clickEl(
+          await call(centerOfText, "body", '[role="menuitemradio"]', zh ? "添加 SSH 主机…" : "Add SSH host…"),
+        );
+        await until("host form", () => !!document.querySelector('input[placeholder="user@host"]'));
+        await until("config aliases", () => !!document.querySelector('option[value="review-fixture"]'));
+        assert(await call(pageFits), "SSH host form overflows");
+        await shot(`${localeName}-${width}-ssh-add`);
+        const setInput = (selector, value) => {
+          const input = document.querySelector(selector);
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(input, value);
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        };
+        // Refresh is read-only; empty and failed reads still allow manual targets.
+        for (const mode of ["empty", "failed", "partial"]) {
+          await call((mode) => sessionStorage.setItem("mingle.ssh-config", mode), mode);
+          await clickEl(await call(centerOfText, "main", "button", zh ? "刷新" : "Refresh"));
+          const messages = zh
+            ? { empty: "没有找到主机别名", failed: "无法读取 SSH 配置", partial: "部分配置未能读取" }
+            : {
+                empty: "No host aliases found",
+                failed: "Could not read SSH config",
+                partial: "Some configuration could not be read",
+              };
+          await until("config result", (text) => document.body.textContent.includes(text), messages[mode]);
+          assert(await call(pageFits), "SSH config message overflows");
+          await shot(`${localeName}-${width}-ssh-config-${mode}`);
+        }
+        await call(() => sessionStorage.removeItem("mingle.ssh-config"));
+        await call(setInput, 'input[placeholder="user@host"]', "bad-host");
+        await clickEl(await call(centerOfText, "main", "button", zh ? "准备并连接" : "Prepare and connect"));
+        await until(
+          "localized SSH error",
+          (text) => document.body.textContent.includes(text),
+          zh ? "SSH 认证失败" : "SSH authentication failed",
+        );
+        await shot(`${localeName}-${width}-ssh-error`);
+        await clickEl(await call(centerOfText, "main", "button", zh ? "刷新" : "Refresh"));
+        await until(
+          "config refreshed",
+          () => !document.querySelector('option[value="review-fixture"]').parentElement.disabled,
+        );
+        assert(
+          await call(() => document.querySelector('input[placeholder="user@host"]').value === "bad-host"),
+          "refresh discarded manual target",
+        );
+        await call(setInput, 'input[placeholder="user@host"]', "missing-node");
+        await clickEl(await call(centerOfText, "main", "button", zh ? "准备并连接" : "Prepare and connect"));
+        await until(
+          "remote installer",
+          (text) => document.body.textContent.includes(text),
+          zh ? "在远端安装 Node.js" : "Install Node.js on the remote host",
+        );
+        assert(await call(pageFits), "remote installer overflows");
+        assert(
+          await call(() =>
+            /github\.com\/gerayking\/Mingle\/blob\/[a-f0-9]{40}\/scripts\/install-remote\.sh$/.test(
+              document.querySelector('a[href*="scripts/install-remote.sh"]').href,
+            ),
+          ),
+          "installer source is not pinned",
+        );
+        assert(await call(() => !document.querySelector("main pre")), "manual command should be collapsed");
+        await shot(`${localeName}-${width}-ssh-install-auto`);
+        await clickEl(await call(centerOfText, "main", "button", zh ? "手动安装" : "Manual installation"));
+        await clickEl(await call(centerOfText, "main", "button", zh ? "复制安装命令" : "Copy install command"));
+        await until(
+          "install command copied or shown",
+          (copied, failed) => document.body.textContent.includes(copied) || document.body.textContent.includes(failed),
+          zh ? "已复制命令" : "Command copied",
+          zh ? "复制失败" : "Could not copy",
+        );
+        await shot(`${localeName}-${width}-ssh-install`);
+        await clickEl(await call(centerOfText, "main", "button", zh ? "手动安装" : "Manual installation"));
+        await clickEl(await call(centerOfText, "main", "button", zh ? "安装并连接" : "Install and connect"));
+        await until(
+          "install progress",
+          (text) => document.body.textContent.includes(text),
+          zh ? "正在安装远端环境" : "Installing remote environment",
+        );
+        assert(
+          await call(() => document.querySelector('input[placeholder="user@host"]').disabled),
+          "host changed during installation",
+        );
+        assert(
+          await call(
+            (label) => !document.querySelector(`main button[aria-label="${label}"]`),
+            zh ? "运行位置" : "Run on",
+          ),
+          "location can be left during installation",
+        );
+        await shot(`${localeName}-${width}-ssh-install-running`);
+        await call(() => sessionStorage.setItem("mingle.ssh-install-phase", "poll-failed"));
+        await until(
+          "install progress unavailable",
+          (text) => document.body.textContent.includes(text),
+          zh ? "重查进度" : "Check progress again",
+        );
+        await shot(`${localeName}-${width}-ssh-install-poll-failed`);
+        await call(() => sessionStorage.setItem("mingle.ssh-install-phase", "preparing"));
+        await clickEl(await call(centerOfText, "main", "button", zh ? "重查进度" : "Check progress again"));
+        await until(
+          "install preparing",
+          (text) => document.body.textContent.includes(text),
+          zh ? "正在准备远端 Mingle" : "Preparing remote Mingle",
+        );
+        await shot(`${localeName}-${width}-ssh-install-preparing`);
+        await call(() => sessionStorage.setItem("mingle.ssh-install-phase", "failed"));
+        await until(
+          "install failed",
+          (text) => document.body.textContent.includes(text),
+          zh ? "远端主机无法下载" : "The remote host could not download",
+        );
+        assert(
+          await call(() => !document.querySelector('input[placeholder="user@host"]').disabled),
+          "failed installation cannot be retried",
+        );
+        await shot(`${localeName}-${width}-ssh-install-failed`);
+        await call(() => {
+          const select = document.querySelector('option[value="review-fixture"]').parentElement;
+          select.value = "review-fixture";
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+        await until(
+          "config alias selected",
+          () => document.querySelector('input[placeholder="user@host"]').value === "review-fixture",
+        );
+        assert(
+          await call(() => !document.querySelector('a[href*="scripts/install-remote.sh"]')),
+          "installer state leaked to another host",
+        );
+        await clickEl(await call(centerOfText, "main", "button", zh ? "安装远端环境" : "Install remote environment"));
+        await clickEl(await call(centerOfText, "main", "button", zh ? "安装并连接" : "Install and connect"));
+        await until(
+          "install retry started",
+          (text) => document.body.textContent.includes(text),
+          zh ? "正在安装远端环境" : "Installing remote environment",
+        );
+        await call(() => sessionStorage.setItem("mingle.ssh-install-phase", "done"));
+        await until("remote brain", () => document.body.textContent.includes("Remote test brain"));
+        assert(
+          await call(() => JSON.parse(sessionStorage.getItem("mingle.ssh-installed")).host === "review-fixture"),
+          "installation did not use the SSH config alias",
+        );
+        assert(await call(pageFits), "remote brain form overflows");
+        await shot(`${localeName}-${width}-ssh-ready`);
+        await call(setInput, "input[aria-label]", "Remote companion");
+        await call(() => document.querySelector('button[type="submit"]').scrollIntoView({ block: "center" }));
+        await clickEl(
+          await call(() => {
+            const button = document.querySelector('button[type="submit"]');
+            const r = button.getBoundingClientRect();
+            return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+          }),
+        );
+        await until("remote create navigation", () =>
+          location.pathname.includes("ssh_0123456789ab~remote-review/connect"),
+        );
+        assert(
+          await call(
+            () => JSON.parse(sessionStorage.getItem("mingle.ssh-created")).harness === "ssh_0123456789ab~scripted",
+          ),
+          "created agent used local harness",
+        );
+        await call(() => sessionStorage.setItem("mingle.ssh-review", "offline"));
+        await goto(`/a/ssh_0123456789ab~remote-review`, labels);
+        await until(
+          "unreachable banner",
+          (text) => document.body.textContent.includes(text),
+          zh ? "SSH 暂时无法连接" : "SSH is unreachable",
+        );
+        assert(await call(pageFits), "unreachable remote page overflows");
+        await shot(`${localeName}-${width}-ssh-offline`);
+        // A rebooted host is prepared again from its agent's page, in place.
+        await clickEl(await call(centerOfText, "main", "button", zh ? "准备或重新连接" : "Prepare or reconnect"));
+        await until(
+          "reconnect in place",
+          (text) => document.body.textContent.includes(text),
+          zh ? "远端主机重启后可在此恢复服务" : "Use after the remote host restarts",
+        );
+        assert(await call(pageFits), "reconnect panel overflows");
+        await shot(`${localeName}-${width}-ssh-reconnect`);
+        await call(() => sessionStorage.removeItem("mingle.ssh-review"));
+        passed++;
+        console.log(`remote ${localeName} ${width}: passed`);
+      }
+    }
+    // --- bot permissions: each one a row, the optional ones turned on in place -------------
+    for (const [localeName, labels] of Object.entries(LOCALES)) {
+      const zh = localeName === "zh-CN";
+      for (const width of [1440, 560]) {
+        for (const state of ["off", "granted", "several"]) {
+          const tag = `permissions ${localeName} ${width} ${state}`;
+          await metrics(width);
+          await send("Page.navigate", { url: `${url}/a/${slug}#token=${token}` });
+          await until("page load", () => document.readyState === "complete" && !!document.querySelector("header"));
+          await call(
+            (locale, mode) => {
+              localStorage.setItem("mingle.locale", locale);
+              sessionStorage.setItem("mingle.permissions-review", mode);
+            },
+            labels.storage,
+            state,
+          );
+          await send("Page.reload");
+          await until("app ready", () => !!document.querySelector('header [role="radiogroup"]'));
+          await call((settings) => {
+            const tab = [...document.querySelectorAll('header [role="radio"]')].find(
+              (b) => b.textContent.trim() === settings,
+            );
+            tab?.click();
+          }, labels.settings);
+          // Rows load in over a moment: click once the row has stopped moving.
+          await clickEl(await settled("feishu bot row", centerOfText, "main", "span", "Alex 徒步助手"));
+          await until(
+            "feishu bot page",
+            (name) => document.querySelector("main nav") && document.body.textContent.includes(name),
+            zh ? "飞书" : "Feishu",
+          );
+          const profiles = zh ? "成员资料" : "Member profiles";
+          await until("permission rows", (text) => document.body.textContent.includes(text), profiles);
+          const turnOn = await call(centerOfText, "main", "button", zh ? "开启" : "Turn on");
+          assert(
+            state === "granted" ? !turnOn : Boolean(turnOn),
+            `${tag}: turn-on button ${turnOn ? "shown" : "missing"}`,
+          );
+          // More than one permission off gets a single button that scans for all of them.
+          const turnAll = await call(centerOfText, "main", "button", zh ? "全部开启" : "Turn all on");
+          assert(
+            state === "several" ? Boolean(turnAll) : !turnAll,
+            `${tag}: turn-all-on button ${turnAll ? "shown" : "missing"}`,
+          );
+          await until(
+            "contact with profile",
+            (text) => document.body.textContent.includes(text),
+            "KubeBlocks Enterprise 产品部",
+          );
+          assert(await call(pageFits), `${tag}: page overflows`);
+          await shot(`${localeName}-${width}-permissions-${state}`);
+          if ((state === "off" || state === "several") && width === 1440) {
+            // Turning on opens the scan in place: one row adds one, "Turn all on" adds them all.
+            await clickEl(state === "several" ? turnAll : turnOn);
+            await until(
+              "scan opens in place",
+              (cancel) => [...document.querySelectorAll("main button")].some((b) => b.textContent.trim() === cancel),
+              labels.cancel,
+            );
+            await shot(`${localeName}-${width}-permissions-scan`);
+          }
+          await call(() => sessionStorage.removeItem("mingle.permissions-review"));
+          passed++;
+          console.log(`${tag}: passed`);
+        }
+      }
+    }
+
+    // --- sidebar agent drag-and-drop reorder ------------------------------------------------
+    {
+      const tag = "sidebar agent drag reorder";
+      await metrics(1440);
+      await goto(`/a/${slug}`, LOCALES["zh-CN"]);
+      const rowIds = () =>
+        [...document.querySelectorAll("aside [data-agent-row]")].map((el) => el.getAttribute("data-agent-row"));
+      const rowBox = (index) => {
+        const el = document.querySelectorAll("aside [data-agent-row]")[index];
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2, top: r.top, height: r.height };
+      };
+      const before = await call(rowIds);
+      assert(before.length >= 3, `${tag}: expected at least 3 agents`);
+      const startPath = await call(() => location.pathname);
+
+      // Drag row 1 up above row 0, then press Escape to cancel: order must stay unchanged.
+      const r0 = await call(rowBox, 0);
+      const r1 = await call(rowBox, 1);
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: r1.x, y: r1.y });
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", x: r1.x, y: r1.y, button: "left", clickCount: 1 });
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: r1.x, y: r1.y - 12, buttons: 1 });
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: r0.x, y: r0.top + 4, buttons: 1 });
+      await key("Escape", "Escape", 27);
+      await send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: r0.x,
+        y: r0.top + 4,
+        button: "left",
+        clickCount: 1,
+      });
+      await new Promise((r) => setTimeout(r, 240));
+      assert(JSON.stringify(await call(rowIds)) === JSON.stringify(before), `${tag}: Escape did not cancel drag`);
+
+      // Drag row 1 up above row 0 and release: order updates immediately and persists across reload.
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: r1.x, y: r1.y });
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", x: r1.x, y: r1.y, button: "left", clickCount: 1 });
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: r1.x, y: r1.y - 12, buttons: 1 });
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: r0.x, y: r0.top + 4, buttons: 1 });
+      await send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: r0.x,
+        y: r0.top + 4,
+        button: "left",
+        clickCount: 1,
+      });
+      const expected = [before[1], before[0], ...before.slice(2)];
+      await until(
+        "reordered sidebar",
+        (want) =>
+          JSON.stringify(
+            [...document.querySelectorAll("aside [data-agent-row]")].map((el) => el.getAttribute("data-agent-row")),
+          ) === want,
+        JSON.stringify(expected),
+      );
+      // Dropping must not accidentally navigate to the dragged row.
+      assert((await call(() => location.pathname)) === startPath, `${tag}: drop triggered navigation`);
+
+      // Wait briefly for PUT /v1/admin/agents/order, then reload and verify persistence.
+      await until(
+        "order persisted on server",
+        async (want) => {
+          const t = sessionStorage.getItem("mingle.token") || "";
+          const res = await fetch("/v1/admin/status", { headers: { authorization: `Bearer ${t}` } });
+          const data = await res.json();
+          return JSON.stringify(data.agents.map((a) => a.id)) === want;
+        },
+        JSON.stringify(expected),
+      );
+      await send("Page.reload");
+      await until(
+        "reordered after reload",
+        (want) =>
+          JSON.stringify(
+            [...document.querySelectorAll("aside [data-agent-row]")].map((el) => el.getAttribute("data-agent-row")),
+          ) === want,
+        JSON.stringify(expected),
+      );
+      assert(await call(pageFits), `${tag}: page overflows`);
+
+      // Restore original order.
+      await call(async (ids) => {
+        const t = sessionStorage.getItem("mingle.token") || "";
+        await fetch("/v1/admin/agents/order", {
+          method: "PUT",
+          headers: { authorization: `Bearer ${t}`, "content-type": "application/json" },
+          body: JSON.stringify({ ids }),
+        });
+      }, before);
+      passed++;
+      console.log(`${tag}: passed`);
+    }
+
     console.log(`${passed} interaction scenarios passed`);
   } finally {
     try {

@@ -1,0 +1,95 @@
+scenario                           algo   rnd/ans waste/h  p50  p90  >2m% cold90  drop
+duet, long pauses                  V1        1.07     0.4   92  120  10.1    137   0.0
+duet, long pauses                  V3b       1.33     2.3   48   59   1.6     65   0.0
+duet, long pauses                  V3e       1.33     2.3   48   61   4.5     61   0.0
+duet, long pauses                  V3e-nc    1.33     2.3   48   61   4.3     64   0.0
+duet, long pauses                  V3f       1.33     2.3   48   61   2.7     64   0.0
+duet, long pauses                  V3g       1.33     2.3   48   61   3.0     61   0.0
+duet, long pauses                  V3eX      1.33     2.3   48   61   4.5     61   0.0
+duet, long pauses                  V3gX      1.33     2.3   48   61   3.0     61   0.0
+
+30 ppl, 6/min + 1 peer             V1        1.84     6.0   95  125  13.6    212   2.8
+30 ppl, 6/min + 1 peer             V3b       1.91     9.8   48   63   2.9    135   1.9
+30 ppl, 6/min + 1 peer             V3e       2.11    14.6   48   63   2.4     72   1.0
+30 ppl, 6/min + 1 peer             V3e-nc    1.93     9.6   48   64   4.2    127   2.0
+30 ppl, 6/min + 1 peer             V3f       1.91     9.6   48   68   4.1    130   1.8
+30 ppl, 6/min + 1 peer             V3g       2.09    14.8   48   63   2.1     76   0.8
+30 ppl, 6/min + 1 peer             V3eX      2.11    14.6   48   63   2.4     72   1.0
+30 ppl, 6/min + 1 peer             V3gX      2.09    14.8   48   63   2.1     76   0.8
+
+12 ppl, 3 peers + 3/min            V1        0.78     5.0   96  124  13.1    182   1.4
+12 ppl, 3 peers + 3/min            V3b       1.16    10.8   49   67   2.1    108   0.4
+12 ppl, 3 peers + 3/min            V3e       1.22    15.4   49   67   1.2     76   0.2
+12 ppl, 3 peers + 3/min            V3e-nc    1.16    11.9   49   66   1.7    108   0.4
+12 ppl, 3 peers + 3/min            V3f       1.15    11.9   49   66   1.5    108   0.4
+12 ppl, 3 peers + 3/min            V3g       1.21    14.9   50   66   1.1     77   0.2
+12 ppl, 3 peers + 3/min            V3eX      1.22    15.3   49   66   1.3     75   0.2
+12 ppl, 3 peers + 3/min            V3gX      1.21    14.9   50   66   1.2     76   0.2
+
+50 ppl, 30/min flood + 1 peer      V1        6.97     7.2   58   98   0.0     65   3.0
+50 ppl, 30/min flood + 1 peer      V3b       1.90    12.6   47   59   0.2     67   1.5
+50 ppl, 30/min flood + 1 peer      V3e       1.99    12.9   47   59   0.0     64   1.9
+50 ppl, 30/min flood + 1 peer      V3e-nc    1.93    12.5   47   59   0.0     67   1.8
+50 ppl, 30/min flood + 1 peer      V3f       1.93    12.5   47   59   0.0     67   1.8
+50 ppl, 30/min flood + 1 peer      V3g       1.99    12.9   47   59   0.0     64   1.9
+50 ppl, 30/min flood + 1 peer      V3eX      1.99    12.9   47   59   0.0     64   1.9
+50 ppl, 30/min flood + 1 peer      V3gX      1.99    12.9   47   59   0.0     64   1.9
+
+30 ppl + noisy cues (10%)          V1        1.84     6.0   95  125  13.6    212   2.8
+30 ppl + noisy cues (10%)          V3b       1.91     9.8   48   63   2.9    135   1.9
+30 ppl + noisy cues (10%)          V3e       2.34    17.7   49   69   4.3    112   1.3
+30 ppl + noisy cues (10%)          V3e-nc    1.93     9.6   48   64   4.2    127   2.0
+30 ppl + noisy cues (10%)          V3f       1.91     9.6   48   68   4.1    130   1.8
+30 ppl + noisy cues (10%)          V3g       2.32    17.9   49   69   3.7    132   1.0
+30 ppl + noisy cues (10%)          V3eX      2.34    17.7   49   69   4.3    112   1.3
+30 ppl + noisy cues (10%)          V3gX      2.32    17.9   49   69   3.7    132   1.0
+
+12 ppl, 1 peer + name spammer      V1        1.92     5.8   95  127  16.5    273   2.0
+12 ppl, 1 peer + name spammer      V3b       2.24     8.6   61  141  18.9    334   1.5
+12 ppl, 1 peer + name spammer      V3e       2.07    14.8   48   62   1.8     66   0.1
+12 ppl, 1 peer + name spammer      V3e-nc    2.06    10.4   48   64   3.1    112   1.3
+12 ppl, 1 peer + name spammer      V3f       2.06    10.4   48   64   3.1    112   1.3
+12 ppl, 1 peer + name spammer      V3g       2.07    14.8   48   62   1.7     66   0.1
+12 ppl, 1 peer + name spammer      V3eX      2.07    14.8   48   62   1.8     66   0.1
+12 ppl, 1 peer + name spammer      V3gX      2.07    14.8   48   62   1.7     66   0.1
+
+12 ppl, 1 peer + hijacker          V1        1.69     6.2   97  129  15.7    347   2.5
+12 ppl, 1 peer + hijacker          V3b       2.09    11.1   49   66   4.2    199   1.6
+12 ppl, 1 peer + hijacker          V3e       1.97    14.3   47   62   2.7     68   0.8
+12 ppl, 1 peer + hijacker          V3e-nc    1.92    10.0   48   62   3.2    148   1.5
+12 ppl, 1 peer + hijacker          V3f       1.92    10.1   48   62   3.2    125   1.4
+12 ppl, 1 peer + hijacker          V3g       1.98    14.2   47   62   2.4     68   0.8
+12 ppl, 1 peer + hijacker          V3eX      1.97    14.3   47   62   2.7     68   0.8
+12 ppl, 1 peer + hijacker          V3gX      1.98    14.2   47   62   2.4     68   0.8
+
+40 ppl, nobody for agent, 24h      V1         nan     1.4  nan  nan   0.0    nan   0.0
+40 ppl, nobody for agent, 24h      V3b        nan     1.4  nan  nan   0.0    nan   0.0
+40 ppl, nobody for agent, 24h      V3e        nan     2.6  nan  nan   0.0    nan   0.0
+40 ppl, nobody for agent, 24h      V3e-nc     nan     1.4  nan  nan   0.0    nan   0.0
+40 ppl, nobody for agent, 24h      V3f        nan     1.4  nan  nan   0.0    nan   0.0
+40 ppl, nobody for agent, 24h      V3g        nan     2.6  nan  nan   0.0    nan   0.0
+40 ppl, nobody for agent, 24h      V3eX       nan     2.6  nan  nan   0.0    nan   0.0
+40 ppl, nobody for agent, 24h      V3gX       nan     2.6  nan  nan   0.0    nan   0.0
+
+2 peers cross-talk                 V1        0.67     0.6   94  121  10.6    135   0.0
+2 peers cross-talk                 V3b       1.04     9.2   49   68   2.1     92   0.0
+2 peers cross-talk                 V3e       1.05    10.0   49   64   0.9     68   0.0
+2 peers cross-talk                 V3e-nc    1.03     9.0   49   65   1.6     88   0.0
+2 peers cross-talk                 V3f       1.03     9.0   49   65   1.5     88   0.0
+2 peers cross-talk                 V3g       1.05    10.0   49   64   0.9     68   0.0
+2 peers cross-talk                 V3eX      1.05    10.0   49   64   1.0     68   0.0
+2 peers cross-talk                 V3gX      1.05    10.0   49   64   0.9     69   0.0
+
+2 peers cross-talk, slow + 3/min   V1        0.74     3.1   95  125  13.6    142   0.2
+2 peers cross-talk, slow + 3/min   V3b       1.14    13.6   51   84   5.5    123   0.0
+2 peers cross-talk, slow + 3/min   V3e       1.22    15.7   51   71   3.2     74   0.1
+2 peers cross-talk, slow + 3/min   V3e-nc    1.15    14.7   50   71   3.9    120   0.0
+2 peers cross-talk, slow + 3/min   V3f       1.15    14.8   51   72   3.4    104   0.0
+2 peers cross-talk, slow + 3/min   V3g       1.22    15.8   51   71   2.7     72   0.0
+2 peers cross-talk, slow + 3/min   V3eX      1.21    15.9   50   71   3.3     74   0.0
+2 peers cross-talk, slow + 3/min   V3gX      1.20    16.0   51   71   2.8     72   0.0
+
+30 ppl, 6/min, group bucket 4/10m  V3e       2.11    12.3   50   98   7.1    106   2.0
+30 ppl, 6/min, group bucket 4/10m  V3f       1.91     9.6   48   68   4.1    130   1.8
+30 ppl, 6/min, group bucket 4/10m  V3g       2.09    12.5   50   98   6.8    106   2.0
+

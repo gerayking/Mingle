@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AgentEnv } from "./AgentEnv.tsx";
 import type { Navigate } from "./App.tsx";
 import {
@@ -8,11 +8,17 @@ import {
   ApiError,
   api,
   type ConnectionView,
+  type Conversation,
   type HandoffView,
   type Harness,
+  type Hearing,
+  type HearingSettings,
+  type HearTier,
+  hearingSettings,
   type Reminder,
   type Task,
 } from "./api.ts";
+import { PrivateChat, prefetchChat } from "./Chat.tsx";
 import {
   BotPage,
   ChatAppList,
@@ -22,24 +28,28 @@ import {
   focusChatAppRow,
   ReconnectButton,
 } from "./ChatApps.tsx";
-import { fetchCached, peek, remember, useCached } from "./cache.ts";
+import { fetchCached, peek, prefetchCached, reconcileList, remember, useCached } from "./cache.ts";
 import { HandoffItem, HandoffSection } from "./Handoff.tsx";
-import { errorText, type MessageKey, statusDetailText, useI18n } from "./i18n.ts";
+import { errorText, type MessageKey, statusDetailText, type Translate, useI18n } from "./i18n.ts";
 import { ModelPicker } from "./NewAgent.tsx";
 import { online, useOnline } from "./online.ts";
 import { Profile } from "./Profile.tsx";
 import { PlatformIcon } from "./platforms.tsx";
 import { usePolling } from "./poll.ts";
 import { OnlineRows } from "./Settings.tsx";
+import { SshSetup, useSshHosts } from "./SshLocation.tsx";
+import { KEYS, keysAria, onEscape, usePageShortcuts } from "./shortcuts.ts";
 import {
   AgentStatusText,
   ApiKeyHint,
   Avatar,
   Button,
   copyText,
+  ChevronIcon as DisclosureIcon,
   Group,
   GroupRow,
   HarnessIcon,
+  Input,
   PageHeader,
   PauseIcon,
   PlayIcon,
@@ -48,28 +58,41 @@ import {
   Section,
   Segmented,
   Select,
+  Shortcut,
   StatusDot,
   Step,
   Steps,
   shortDateTime,
   Textarea,
+  ThreadIcon,
   Waiting,
 } from "./ui.tsx";
+import { checkFailureSummary, reminderStatus, taskStatus, type WorkDot } from "./work.ts";
 
 type WorkData = { tasks: Task[]; reminders: Reminder[] };
 
-export function AgentPage({
+type Tab = "activity" | "chat" | "settings";
+const TABS: readonly Tab[] = ["activity", "chat", "settings"];
+
+export const AgentPage = memo(function AgentPage({
   agent,
+  requestedTab,
   onNavigate,
   onChanged,
 }: {
   agent: AgentView;
+  /** A link or a notification opened a tab: each new request switches to it, once. */
+  requestedTab?: { tab: Tab } | undefined;
   onNavigate: Navigate;
   onChanged: () => Promise<void> | void;
 }) {
   const { t } = useI18n();
   // The last activity and work seen for an agent show at once when its page opens again.
-  const [activity, setActivity] = useState<Activity[] | null>(() => peek<Activity[]>(`activity:${agent.id}`) ?? null);
+  const [conversations, setConversations] = useState<Conversation[] | null>(
+    () => peek<Conversation[]>(`conversations:${agent.id}`) ?? null,
+  );
+  // Every message the activity holds, for what needs the owner and the getting-started card.
+  const activity = useMemo(() => conversations?.flatMap((c) => c.messages) ?? null, [conversations]);
   const [work, setWork] = useState<WorkData | null>(() => peek<WorkData>(`work:${agent.id}`) ?? null);
   const [handoffs, setHandoffs] = useState<HandoffView[] | null>(
     () => peek<HandoffView[]>(`handoffs:${agent.id}`) ?? null,
@@ -80,7 +103,7 @@ export function AgentPage({
   const workPending = useRef(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [tab, setTab] = useState<"activity" | "settings">("activity");
+  const [tab, setTab] = useState<Tab>(() => requestedTab?.tab ?? "activity");
   const connectionsRef = useRef<HTMLElement>(null);
   const handoffRef = useRef<HTMLDivElement>(null);
   const [handoffRequest, setHandoffRequest] = useState(0);
@@ -123,28 +146,35 @@ export function AgentPage({
   // Each resource guards itself: a slow call is not superseded by the next poll, and one
   // request in flight does not hold back the other resource. `fresh` lets a remount read
   // again even if a previous mount's read is still resolving; only the latest read caches.
+  const includeHandoffs = tab !== "chat";
   const refreshActivity = useCallback(async () => {
     if (activityPending.current) return;
     activityPending.current = true;
     try {
       const [items, handed] = await Promise.all([
-        fetchCached(`activity:${agent.id}`, () => api.activity(agent.id), true),
-        fetchCached(`handoffs:${agent.id}`, () => api.handoffs(agent.id), true),
+        fetchCached(`conversations:${agent.id}`, () => api.conversations(agent.id), true),
+        includeHandoffs ? fetchCached(`handoffs:${agent.id}`, () => api.handoffs(agent.id), true) : null,
       ]);
-      setActivity(items);
-      setHandoffs(handed);
+      setConversations((prev) => reconcileList(prev, items, (c) => c.chat.id));
+      if (handed !== null) setHandoffs((prev) => reconcileList(prev, handed, (h) => h.id));
       setActivityError(false);
     } catch {
       setActivityError(true);
     } finally {
       activityPending.current = false;
     }
-  }, [agent.id]);
+  }, [agent.id, includeHandoffs]);
   const refreshWork = useCallback(async () => {
     if (workPending.current) return;
     workPending.current = true;
     try {
-      setWork(await fetchCached(`work:${agent.id}`, () => api.work(agent.id), true));
+      const next = await fetchCached(`work:${agent.id}`, () => api.work(agent.id), true);
+      setWork((prev) => {
+        if (!prev || prev === next) return next;
+        const tasks = reconcileList(prev.tasks, next.tasks, (item) => item.id);
+        const reminders = reconcileList(prev.reminders, next.reminders, (item) => item.id);
+        return tasks === prev.tasks && reminders === prev.reminders ? prev : { tasks, reminders };
+      });
       setWorkError(false);
     } catch {
       setWorkError(true);
@@ -174,7 +204,7 @@ export function AgentPage({
 
   // Switching to another agent starts from what was last seen for it.
   useEffect(() => {
-    setActivity(peek<Activity[]>(`activity:${agent.id}`) ?? null);
+    setConversations(peek<Conversation[]>(`conversations:${agent.id}`) ?? null);
     setWork(peek<WorkData>(`work:${agent.id}`) ?? null);
     setHandoffs(peek<HandoffView[]>(`handoffs:${agent.id}`) ?? null);
     setActivityError(false);
@@ -188,7 +218,12 @@ export function AgentPage({
     setBot(null);
     setBackTo(null);
   }, [agent.id]);
-  usePolling(refresh, 2500);
+  useEffect(() => {
+    if (requestedTab) setTab(requestedTab.tab);
+  }, [requestedTab]);
+  // Poll the active view briskly and ease off background tabs; ETag 304 keeps unchanged ticks free.
+  usePolling(refreshActivity, tab === "activity" ? 2500 : 8000);
+  usePolling(refreshWork, tab === "activity" ? 2500 : 6000);
 
   // A notice answers one click; it must not outlive what it describes.
   useEffect(() => {
@@ -200,6 +235,24 @@ export function AgentPage({
   useEffect(() => setNotice(null), [tab]);
 
   const busy = agent.status === "thinking" || agent.status === "working";
+  const stop = async () => {
+    try {
+      const { stopped } = await api.stop(agent.id);
+      setNotice(t(stopped ? "agent.stopped" : "agent.idleNothing"));
+    } catch (error) {
+      setNotice(errorText(t, error));
+    }
+  };
+  usePageShortcuts({
+    // The previous or next tab, stopping at the ends as macOS tabs do.
+    tab: (direction) =>
+      setTab(
+        (current) => TABS[Math.max(0, Math.min(TABS.length - 1, TABS.indexOf(current) + (direction ? 1 : -1)))] as Tab,
+      ),
+    stop: () => {
+      if (busy) void stop();
+    },
+  });
   const paused = agent.status === "paused";
   const [switching, setSwitching] = useState(false);
   const [pauseFailure, setPauseFailure] = useState<string | null>(null);
@@ -220,52 +273,93 @@ export function AgentPage({
     await onChanged();
     refresh();
   };
-  const retry = async (ids: string[]) => {
-    try {
-      const { retried, offline } = await api.retry(agent.id, ids);
-      const bots = agent.connections
-        .filter((c) => offline.includes(c.id))
-        .map((c) => c.bot ?? t(`platform.${c.platform}` as MessageKey));
-      setNotice(
-        retried.length > 0
-          ? t("agent.retrying", { count: String(retried.length), name: agent.name })
-          : bots.length > 0
-            ? t("agent.retryOffline", { bot: bots.join(", ") })
-            : t("agent.retryNothing"),
-      );
-    } catch (error) {
-      setNotice(errorText(t, error));
-    }
-    refresh();
-  };
-  const ignore = async (ids: string[]) => {
-    try {
-      const { ignored } = await api.ignore(agent.id, ids);
-      const changed = new Set(ignored);
-      setActivity((items) => items?.map((m) => (changed.has(m.id) ? { ...m, state: "ignored" } : m)) ?? null);
-      setNotice(
-        ignored.length ? t("agent.ignoredNotice", { count: String(ignored.length) }) : t("agent.ignoreUnchanged"),
-      );
-    } catch (error) {
-      setNotice(errorText(t, error));
-    }
-    refresh();
-  };
-  const decide = async (request: AccessRequest, access: "allowed" | "blocked") => {
-    const name = requestName(t, request);
-    try {
-      await api.setAccess(agent.id, request.kind, request.id, access);
-      setNotice(t(access === "allowed" ? "needs.allowed" : "needs.declined", { name, agent: agent.name }));
-    } catch (error) {
-      setNotice(errorText(t, error));
-    }
-    await onChanged();
-    refresh();
-  };
-  const connect = () => onNavigate({ kind: "connect", slug: agent.slug });
-  const unanswered = (activity ?? []).filter((m) => m.direction === "in" && m.state === "unanswered");
-  const failed = (activity ?? []).filter((m) => m.direction === "in" && m.state === "failed");
-  const troubled = agent.connections.filter((c) => c.state === "error" || c.state === "awaiting_approval");
+  const retry = useCallback(
+    async (ids: string[]) => {
+      try {
+        const { retried, offline } = await api.retry(agent.id, ids);
+        const bots = agent.connections
+          .filter((c) => offline.includes(c.id))
+          .map((c) => c.bot ?? t(`platform.${c.platform}` as MessageKey));
+        setNotice(
+          retried.length > 0
+            ? t("agent.retrying", { count: String(retried.length), name: agent.name })
+            : bots.length > 0
+              ? t("agent.retryOffline", { bot: bots.join(", ") })
+              : t("agent.retryNothing"),
+        );
+      } catch (error) {
+        setNotice(errorText(t, error));
+      }
+      refresh();
+    },
+    [agent.connections, agent.id, agent.name, refresh, t],
+  );
+  const ignore = useCallback(
+    async (ids: string[]) => {
+      try {
+        const { ignored } = await api.ignore(agent.id, ids);
+        const changed = new Set(ignored);
+        setConversations(
+          (items) =>
+            items?.map((c) => ({
+              ...c,
+              messages: c.messages.map((m) => (changed.has(m.id) ? { ...m, state: "ignored" } : m)),
+            })) ?? null,
+        );
+        setNotice(
+          ignored.length ? t("agent.ignoredNotice", { count: String(ignored.length) }) : t("agent.ignoreUnchanged"),
+        );
+      } catch (error) {
+        setNotice(errorText(t, error));
+      }
+      refresh();
+    },
+    [agent.id, refresh, t],
+  );
+  const decide = useCallback(
+    async (request: AccessRequest, access: "allowed" | "blocked") => {
+      const name = requestName(t, request);
+      try {
+        await api.setAccess(agent.id, request.kind, request.id, access);
+        setNotice(t(access === "allowed" ? "needs.allowed" : "needs.declined", { name, agent: agent.name }));
+      } catch (error) {
+        setNotice(errorText(t, error));
+      }
+      await onChanged();
+      refresh();
+    },
+    [agent.id, agent.name, onChanged, refresh, t],
+  );
+  const connect = useCallback(() => onNavigate({ kind: "connect", slug: agent.slug }), [agent.slug, onNavigate]);
+  const openChatTab = useCallback(() => setTab("chat"), []);
+  const prefetchTab = useCallback(
+    (next: Tab) => {
+      if (next === "chat") {
+        prefetchChat(agent.id);
+      } else if (next === "settings") {
+        prefetchCached(`env:${agent.id}`, () => api.env(agent.id), 10_000);
+        prefetchCached("harnesses", api.harnesses, 15_000);
+        prefetchCached(`contacts:${agent.id}`, () => api.contacts(agent.id), 10_000);
+      } else {
+        prefetchCached(`conversations:${agent.id}`, () => api.conversations(agent.id));
+        prefetchCached(`handoffs:${agent.id}`, () => api.handoffs(agent.id));
+        prefetchCached(`work:${agent.id}`, () => api.work(agent.id));
+      }
+    },
+    [agent.id],
+  );
+  const unansweredIds = useMemo(
+    () => (activity ?? []).filter((m) => m.direction === "in" && m.state === "unanswered").map((m) => m.id),
+    [activity],
+  );
+  const failedIds = useMemo(
+    () => (activity ?? []).filter((m) => m.direction === "in" && m.state === "failed").map((m) => m.id),
+    [activity],
+  );
+  const troubled = useMemo(
+    () => agent.connections.filter((c) => c.state === "error" || c.state === "awaiting_approval"),
+    [agent.connections],
+  );
 
   // With no bot left, the side panel is where to add one again (the getting-started card is gone by then).
   const hasNeeds =
@@ -273,18 +367,19 @@ export function AgentPage({
     agent.hasReplied ||
     troubled.length > 0 ||
     agent.requests.length > 0 ||
-    unanswered.length > 0 ||
-    failed.length > 0;
+    unansweredIds.length > 0 ||
+    failedIds.length > 0;
   const needsYou = hasNeeds ? (
     <NeedsYou
       agent={agent}
-      unanswered={unanswered.map((m) => m.id)}
-      failed={failed.map((m) => m.id)}
+      unanswered={unansweredIds}
+      failed={failedIds}
       troubled={troubled}
       onRetry={retry}
       onIgnore={ignore}
       onDecide={decide}
       onConnect={connect}
+      {...(!agent.remote ? { onProxySettings: () => onNavigate({ kind: "settings", focus: "network" }) } : {})}
     />
   ) : null;
 
@@ -293,215 +388,246 @@ export function AgentPage({
       <PageHeader
         leading={<Avatar name={agent.name} src={agent.avatar} size={26} />}
         title={agent.name}
-        meta={<AgentStatusText status={agent.status} detail={agent.statusDetail} />}
+        meta={
+          <AgentStatusText
+            status={agent.status}
+            detail={agent.statusDetail}
+            where={agent.remote}
+            {...(agent.doing ? { more: t("agent.doing", { count: String(agent.doing) }) } : {})}
+          />
+        }
         actions={
           <>
             <Segmented
               label={t("agent.view")}
               value={tab}
               onChange={setTab}
-              options={[
-                { value: "activity", label: t("agent.tabActivity") },
-                { value: "settings", label: t("agent.tabSettings") },
-              ]}
+              onPrefetch={prefetchTab}
+              // Each neighbour of the tab shown carries the key that goes to it.
+              options={TABS.map((value, i) => {
+                const step = i - TABS.indexOf(tab);
+                const label = t(
+                  value === "activity" ? "agent.tabActivity" : value === "chat" ? "agent.tabChat" : "agent.tabSettings",
+                );
+                return step === -1 || step === 1
+                  ? { value, label, keys: KEYS.tab(step === 1 ? 1 : 0) }
+                  : { value, label };
+              })}
             />
             {busy ? (
-              <Button
-                small
-                title={t("agent.stopHint")}
-                onClick={async () => {
-                  try {
-                    const { stopped } = await api.stop(agent.id);
-                    setNotice(t(stopped ? "agent.stopped" : "agent.idleNothing"));
-                  } catch (error) {
-                    setNotice(errorText(t, error));
-                  }
-                }}
-              >
-                {t("agent.stop")}
-              </Button>
+              <Shortcut label={t("agent.stopHint")} keys={KEYS.stop} side="bottom">
+                <Button small aria-keyshortcuts={keysAria(KEYS.stop)} onClick={stop}>
+                  {t("agent.stop")}
+                </Button>
+              </Shortcut>
             ) : null}
           </>
         }
       />
       <div className="flex min-h-0 flex-1">
-        <div ref={scrollerRef} className="min-h-0 min-w-0 flex-1 overflow-y-auto">
-          <div className="flex max-w-[680px] flex-col gap-7 px-6 py-6 md:px-8">
-            {notice ? <p className="rise -mb-3 text-small text-ink2">{notice}</p> : null}
-            {paused ? <PausedCard name={agent.name} disabled={switching} onResume={() => setPaused(false)} /> : null}
-            {agent.status === "error" ? <AgentError agent={agent} /> : null}
+        {tab === "chat" ? (
+          <PrivateChat
+            agent={agent}
+            top={
+              agent.remote?.reachable === false || notice || paused || agent.status === "error" ? (
+                <>
+                  {agent.remote?.reachable === false ? <Unreachable id={agent.remote.id} onReady={onChanged} /> : null}
+                  {notice ? <p className="rise text-small text-ink2">{notice}</p> : null}
+                  {paused ? (
+                    <PausedCard name={agent.name} disabled={switching} onResume={() => setPaused(false)} />
+                  ) : null}
+                  {agent.status === "error" ? <AgentError agent={agent} /> : null}
+                </>
+              ) : undefined
+            }
+            onRetry={retry}
+            onIgnore={ignore}
+          />
+        ) : (
+          <div ref={scrollerRef} className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain">
+            <div className="flex max-w-[680px] flex-col gap-7 px-6 py-6 md:px-8">
+              {agent.remote?.reachable === false ? <Unreachable id={agent.remote.id} onReady={onChanged} /> : null}
+              {notice ? <p className="rise -mb-3 text-small text-ink2">{notice}</p> : null}
+              {paused ? <PausedCard name={agent.name} disabled={switching} onResume={() => setPaused(false)} /> : null}
+              {agent.status === "error" ? <AgentError agent={agent} /> : null}
 
-            {tab === "settings" && openBot ? (
-              <BotPage
-                agent={agent}
-                connection={openBot}
-                onBack={() => {
-                  setBackTo(openBot.id);
-                  setBot(null);
-                }}
-                onChanged={() => {
-                  void onChanged();
-                  // A renamed person shows by the new name in the activity right away.
-                  void refreshActivity();
-                }}
-              />
-            ) : tab === "settings" ? (
-              <>
-                <Profile agent={agent} onSaved={onChanged} />
-                <RoleEditor agent={agent} onSaved={onChanged} />
-                <Brain agent={agent} onSaved={onChanged} />
-                <section
-                  ref={connectionsRef}
-                  aria-label={t("agent.chatApps")}
-                  tabIndex={-1}
-                  className="rounded-card focus:outline-2 focus:outline-offset-4 focus:outline-accent"
-                >
-                  <ChatAppList
-                    agent={agent}
-                    onOpen={setBot}
-                    onConnect={connect}
-                    onChanged={() => {
-                      void onChanged();
-                      void refreshActivity();
-                    }}
-                  />
-                </section>
-                <AgentEnv agent={agent} />
-                <div ref={handoffRef} tabIndex={-1} className="rounded-card focus:outline-none">
-                  <HandoffSection agent={agent} handoffs={handoffs} onSent={() => void refreshActivity()} />
-                </div>
-                <Section title={t("agent.lifecycle")}>
-                  <Group>
-                    <GroupRow className="flex-wrap">
-                      <span className="flex min-w-0 flex-1 flex-col">
-                        <span>
-                          {paused
-                            ? t("agent.pausedTitle", { name: agent.name })
-                            : t("agent.pauseTitle", { name: agent.name })}
-                        </span>
-                        <span className="text-caption text-ink2">
-                          {paused
-                            ? t("agent.pausedBody")
-                            : busy
-                              ? `${t("agent.pauseBody")} ${t("agent.pauseBusy")}`
-                              : t("agent.pauseBody")}
-                        </span>
-                      </span>
-                      {paused ? (
-                        <Button small disabled={switching} onClick={() => setPaused(false, "row")}>
-                          <PlayIcon />
-                          {t("agent.resume")}
-                        </Button>
-                      ) : (
-                        <Button small disabled={switching} onClick={() => setPaused(true, "row")}>
-                          <PauseIcon />
-                          {t("agent.pause")}
-                        </Button>
-                      )}
-                      {pauseFailure ? <p className="w-full text-caption text-red">{pauseFailure}</p> : null}
-                    </GroupRow>
-                    <ResetRow key={agent.id} agent={agent} busy={busy} disabled={switching} />
-                    <DiagnosticsRow key={`d-${agent.id}`} agent={agent} />
-                  </Group>
-                </Section>
-                <Section title={t("agent.home")}>
-                  <Group>
-                    <GroupRow>
-                      <span className="flex min-w-0 flex-1 flex-col">
-                        <span>{t("agent.homeTitle")}</span>
-                        <span className="selectable truncate font-mono text-caption text-ink2" title={agent.home}>
-                          {agent.home}
-                        </span>
-                      </span>
-                      <Button small onClick={() => api.openHome(agent.id)}>
-                        {t("agent.openHome")}
-                      </Button>
-                    </GroupRow>
-                    <DeleteRow
+              {tab === "settings" && openBot ? (
+                <BotPage
+                  agent={agent}
+                  connection={openBot}
+                  onBack={() => {
+                    setBackTo(openBot.id);
+                    setBot(null);
+                  }}
+                  onChanged={() => {
+                    void onChanged();
+                    // A renamed person shows by the new name in the activity right away.
+                    void refreshActivity();
+                  }}
+                />
+              ) : tab === "settings" ? (
+                <>
+                  <Profile agent={agent} onSaved={onChanged} />
+                  <RoleEditor agent={agent} onSaved={onChanged} />
+                  <Brain agent={agent} onSaved={onChanged} />
+                  <section
+                    ref={connectionsRef}
+                    aria-label={t("agent.chatApps")}
+                    tabIndex={-1}
+                    className="rounded-card focus:outline-2 focus:outline-offset-4 focus:outline-accent"
+                  >
+                    <ChatAppList
                       agent={agent}
-                      confirming={confirmDelete}
-                      onAsk={() => setConfirmDelete(true)}
-                      onCancel={() => setConfirmDelete(false)}
-                      onDeleted={async () => {
-                        // Refresh first: with the old list, "home" would pick the deleted agent again.
-                        await onChanged();
-                        onNavigate({ kind: "home" }, { replace: true });
+                      onOpen={setBot}
+                      onConnect={connect}
+                      onChanged={() => {
+                        void onChanged();
+                        void refreshActivity();
                       }}
                     />
-                  </Group>
-                </Section>
-              </>
-            ) : (
-              <>
-                {!agent.hasReplied ? (
-                  <GettingStarted
-                    agent={agent}
-                    heard={(activity ?? []).some((m) => m.direction === "in" && m.state !== "held")}
-                    onConnect={connect}
-                    onChanged={onChanged}
-                    onHandoff={() => {
-                      setTab("settings");
-                      setBot(null);
-                      setHandoffRequest((n) => n + 1);
-                    }}
-                  />
-                ) : null}
-                {agent.connections.some((c) => c.state === "connected") ? <KeepOnline /> : null}
-                {/* Narrow windows have no right panel: what needs the person comes first. */}
-                {needsYou ? <div className="flex flex-col gap-7 min-[1140px]:hidden">{needsYou}</div> : null}
-                <Section title={t("agent.activity")}>
-                  {activityError ? <LoadProblem title={t("agent.activityFailed")} onRetry={refreshActivity} /> : null}
-                  {activity === null ? (
-                    activityError ? null : (
-                      <Waiting>{t("agent.activityLoading")}</Waiting>
-                    )
-                  ) : activity.length > 0 || (handoffs ?? []).length > 0 ? (
-                    <ActivityList
+                  </section>
+                  <AgentEnv agent={agent} />
+                  <div ref={handoffRef} tabIndex={-1} className="rounded-card focus:outline-none">
+                    <HandoffSection agent={agent} handoffs={handoffs} onSent={() => void refreshActivity()} />
+                  </div>
+                  <Section title={t("agent.lifecycle")}>
+                    <Group>
+                      <GroupRow className="flex-wrap">
+                        <span className="flex min-w-0 flex-1 flex-col">
+                          <span>
+                            {paused
+                              ? t("agent.pausedTitle", { name: agent.name })
+                              : t("agent.pauseTitle", { name: agent.name })}
+                          </span>
+                          <span className="text-caption text-ink2">
+                            {paused
+                              ? t("agent.pausedBody")
+                              : busy
+                                ? `${t("agent.pauseBody")} ${t("agent.pauseBusy")}`
+                                : t("agent.pauseBody")}
+                          </span>
+                        </span>
+                        {paused ? (
+                          <Button small disabled={switching} onClick={() => setPaused(false, "row")}>
+                            <PlayIcon />
+                            {t("agent.resume")}
+                          </Button>
+                        ) : (
+                          <Button small disabled={switching} onClick={() => setPaused(true, "row")}>
+                            <PauseIcon />
+                            {t("agent.pause")}
+                          </Button>
+                        )}
+                        {pauseFailure ? <p className="w-full text-caption text-red">{pauseFailure}</p> : null}
+                      </GroupRow>
+                      <TidyRow agent={agent} onChanged={onChanged} />
+                      <ResetRow key={agent.id} agent={agent} busy={busy} disabled={switching} />
+                      <DiagnosticsRow key={`d-${agent.id}`} agent={agent} />
+                    </Group>
+                  </Section>
+                  <Section title={t("agent.home")}>
+                    <Group>
+                      <GroupRow>
+                        <span className="flex min-w-0 flex-1 flex-col">
+                          <span>{t("agent.homeTitle")}</span>
+                          <span className="selectable truncate font-mono text-caption text-ink2" title={agent.home}>
+                            {agent.home}
+                          </span>
+                        </span>
+                        {!agent.remote ? (
+                          <Button small onClick={() => api.openHome(agent.id)}>
+                            {t("agent.openHome")}
+                          </Button>
+                        ) : null}
+                      </GroupRow>
+                      <DeleteRow
+                        agent={agent}
+                        confirming={confirmDelete}
+                        onAsk={() => setConfirmDelete(true)}
+                        onCancel={() => setConfirmDelete(false)}
+                        onDeleted={async () => {
+                          // Refresh first: with the old list, "home" would pick the deleted agent again.
+                          await onChanged();
+                          onNavigate({ kind: "home" }, { replace: true });
+                        }}
+                      />
+                    </Group>
+                  </Section>
+                </>
+              ) : (
+                <>
+                  {!agent.hasReplied ? (
+                    <GettingStarted
                       agent={agent}
-                      items={activity}
-                      handoffs={handoffs ?? []}
-                      onRetry={retry}
-                      onIgnore={ignore}
+                      heard={(activity ?? []).some((m) => m.direction === "in" && m.state !== "held")}
+                      onConnect={connect}
+                      onChanged={onChanged}
+                      onHandoff={() => {
+                        setTab("settings");
+                        setBot(null);
+                        setHandoffRequest((n) => n + 1);
+                      }}
                     />
-                  ) : activityError ? null : (
-                    <div className="flex flex-col items-start gap-3 rounded-card border border-line bg-bg2 p-5">
-                      <svg
-                        width="28"
-                        height="28"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        className="text-ink2"
-                        aria-hidden="true"
-                      >
-                        <path
-                          d="M20 11.5a8 8 0 0 1-8 8H5l-3 2v-10a9 9 0 0 1 18 0Z"
-                          stroke="currentColor"
-                          strokeWidth="1.5"
-                          strokeLinejoin="round"
-                        />
-                        <path d="M7 10h8M7 14h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                      </svg>
-                      <div className="flex flex-col gap-1">
-                        <h3 className="font-semibold">{t("agent.noActivity")}</h3>
-                        <p className="text-small text-ink2">{t("agent.noActivityBody")}</p>
-                        {agent.connections.length === 0 ? (
-                          <p className="text-small text-ink2">{t("agent.noActivityConnect")}</p>
+                  ) : null}
+                  {agent.connections.some((c) => c.state === "connected") ? <KeepOnline /> : null}
+                  {/* Narrow windows have no right panel: what needs the person comes first. */}
+                  {needsYou ? <div className="flex flex-col gap-7 min-[1140px]:hidden">{needsYou}</div> : null}
+                  <Section title={t("agent.activity")}>
+                    {activityError ? <LoadProblem title={t("agent.activityFailed")} onRetry={refreshActivity} /> : null}
+                    {activity === null ? (
+                      activityError ? null : (
+                        <Waiting>{t("agent.activityLoading")}</Waiting>
+                      )
+                    ) : activity.length > 0 || (handoffs ?? []).length > 0 ? (
+                      <ActivityList
+                        key={agent.id}
+                        agent={agent}
+                        conversations={conversations ?? []}
+                        handoffs={handoffs ?? []}
+                        onRetry={retry}
+                        onIgnore={ignore}
+                        onOpenChat={openChatTab}
+                      />
+                    ) : activityError ? null : (
+                      <div className="flex flex-col items-start gap-3 rounded-card border border-line bg-bg2 p-5">
+                        <svg
+                          width="28"
+                          height="28"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          className="text-ink2"
+                          aria-hidden="true"
+                        >
+                          <path
+                            d="M20 11.5a8 8 0 0 1-8 8H5l-3 2v-10a9 9 0 0 1 18 0Z"
+                            stroke="currentColor"
+                            strokeWidth="1.5"
+                            strokeLinejoin="round"
+                          />
+                          <path d="M7 10h8M7 14h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                        </svg>
+                        <div className="flex flex-col gap-1">
+                          <h3 className="font-semibold">{t("agent.noActivity")}</h3>
+                          <p className="text-small text-ink2">{t("agent.noActivityBody")}</p>
+                          {agent.connections.length === 0 ? (
+                            <p className="text-small text-ink2">{t("agent.noActivityConnect")}</p>
+                          ) : null}
+                        </div>
+                        {agent.hasReplied && agent.connections.length === 0 ? (
+                          <Button onClick={connect}>{t("start.connectAction")}</Button>
                         ) : null}
                       </div>
-                      {agent.hasReplied && agent.connections.length === 0 ? (
-                        <Button onClick={connect}>{t("start.connectAction")}</Button>
-                      ) : null}
-                    </div>
-                  )}
-                </Section>
-                <div className="flex flex-col gap-7 min-[1140px]:hidden">
-                  <Work agentId={agent.id} work={work} error={workError} onRetry={refreshWork} onDropped={dropWork} />
-                </div>
-              </>
-            )}
+                    )}
+                  </Section>
+                  <div className="flex flex-col gap-7 min-[1140px]:hidden">
+                    <Work agentId={agent.id} work={work} error={workError} onRetry={refreshWork} onDropped={dropWork} />
+                  </div>
+                </>
+              )}
+            </div>
           </div>
-        </div>
-        <aside className="hidden w-[320px] shrink-0 flex-col gap-6 overflow-y-auto border-l border-line bg-wing px-4 py-5 min-[1140px]:flex">
+        )}
+        <aside className="hidden w-[320px] shrink-0 flex-col gap-6 overflow-y-auto overscroll-contain border-l border-line bg-wing px-4 py-5 min-[1140px]:flex">
           {needsYou}
           {/* Settings lists the same bots with their controls; the panel glances at them only beside the activity. */}
           {tab === "activity" && agent.connections.length ? (
@@ -519,7 +645,7 @@ export function AgentPage({
       </div>
     </>
   );
-}
+});
 
 /** Until the agent has answered someone: the steps that get it there, and where it is. */
 function GettingStarted({
@@ -674,7 +800,7 @@ function KeepOnline() {
   );
 }
 
-function NeedsYou({
+const NeedsYou = memo(function NeedsYou({
   agent,
   unanswered,
   failed,
@@ -683,6 +809,7 @@ function NeedsYou({
   onRetry,
   onIgnore,
   onDecide,
+  onProxySettings,
 }: {
   agent: AgentView;
   unanswered: string[];
@@ -692,6 +819,7 @@ function NeedsYou({
   onRetry: (ids: string[]) => Promise<void>;
   onIgnore: (ids: string[]) => Promise<void>;
   onDecide: (request: AccessRequest, access: "allowed" | "blocked") => Promise<void>;
+  onProxySettings?: () => void;
 }) {
   const { t } = useI18n();
   // Retrying while the harness still fails only fails again; say so, but let the person try.
@@ -711,8 +839,17 @@ function NeedsYou({
         {c.state === "error" ? (
           <>
             {connectionDetail(t, c)}
-            <div className="mt-2">
+            <div className="mt-2 flex flex-wrap items-center gap-3">
               <ReconnectButton connection={c} />
+              {c.detail === "network" && onProxySettings ? (
+                <button
+                  type="button"
+                  onClick={onProxySettings}
+                  className="text-small font-medium text-accent hover:underline"
+                >
+                  {t("proxy.openSettings")}
+                </button>
+              ) : null}
             </div>
           </>
         ) : (
@@ -764,7 +901,7 @@ function NeedsYou({
       )}
     </Section>
   );
-}
+});
 
 /** What to call a person or group asking to talk to the agent. */
 function requestName(t: ReturnType<typeof useI18n>["t"], r: { kind: string; name: string | null }): string {
@@ -881,7 +1018,7 @@ function LoadProblem({ title, onRetry }: { title: string; onRetry: () => Promise
   );
 }
 
-function Work({
+const Work = memo(function Work({
   agentId,
   work,
   error,
@@ -917,23 +1054,35 @@ function Work({
           </p>
         ) : (
           <Group>
-            {work.tasks.map((task) => (
-              <WorkRow
-                key={task.id}
-                label={task.title}
-                action={t("task.close")}
-                actionLabel={t("task.closeLabel", { title: task.title })}
-                ask={t("task.closeAsk")}
-                confirm={t("task.closeYes")}
-                run={() => api.closeTask(agentId, task.id)}
-                onDone={() => onDropped("tasks", task.id)}
-                aside={
-                  <span className="shrink-0 rounded-full bg-bg3 px-2 py-0.5 text-caption text-ink2">
-                    {t(`task.${task.status}` as MessageKey)}
-                  </span>
-                }
-              />
-            ))}
+            {work.tasks.map((task) => {
+              if (task.line) {
+                return (
+                  <LineRow key={task.id} agentId={agentId} task={task} onDropped={() => onDropped("tasks", task.id)} />
+                );
+              }
+              const status = taskStatus(task);
+              return (
+                <WorkRow
+                  key={task.id}
+                  dot={status.dot}
+                  dotLabel={t(status.labelKey)}
+                  label={task.title}
+                  action={t("task.close")}
+                  actionLabel={t("task.closeLabel", { title: task.title })}
+                  ask={t("task.closeAsk")}
+                  confirm={t("task.closeYes")}
+                  run={() => api.closeTask(agentId, task.id)}
+                  onDone={() => onDropped("tasks", task.id)}
+                  aside={
+                    <span
+                      className={`shrink-0 whitespace-nowrap rounded-full px-2 py-0.5 text-caption ${task.status === "done" ? "border border-line2 text-green" : "bg-bg3 text-ink2"}`}
+                    >
+                      {t(`task.${task.status}` as MessageKey)}
+                    </span>
+                  }
+                />
+              );
+            })}
           </Group>
         )}
       </Section>
@@ -945,42 +1094,185 @@ function Work({
           </p>
         ) : (
           <Group>
-            {work.reminders.map((r) => (
-              <WorkRow
-                key={r.id}
-                label={r.body}
-                action={t("reminder.cancel")}
-                actionLabel={t("reminder.cancelLabel", { body: r.body })}
-                ask={t("reminder.cancelAsk")}
-                confirm={t("reminder.cancelYes")}
-                danger
-                run={() => api.cancelReminder(agentId, r.id)}
-                onDone={() => onDropped("reminders", r.id)}
-                detail={
-                  <>
-                    {r.nextFireAt ? shortDateTime(r.nextFireAt, locale) : ""}
-                    {r.lastFiredAt ? (
-                      <span className="text-ink3">
-                        {" · "}
-                        {t("agent.reminderLastFired", { time: shortDateTime(r.lastFiredAt, locale) })}
+            {work.reminders.map((r) => {
+              const status = reminderStatus(r);
+              const failureSummary = r.check ? checkFailureSummary(t, r.check.failures, r.check.error) : null;
+              const meta: { key: string; node: ReactNode }[] = [];
+              if (r.nextFireAt) {
+                meta.push({
+                  key: "next",
+                  node: r.check
+                    ? t("agent.reminderNextCheck", { time: shortDateTime(r.nextFireAt, locale) })
+                    : shortDateTime(r.nextFireAt, locale),
+                });
+              }
+              if (r.check?.lastCheckedAt != null) {
+                meta.push({
+                  key: "checked",
+                  node: (
+                    <span className="text-ink3">
+                      {t("agent.reminderLastChecked", { time: shortDateTime(r.check.lastCheckedAt, locale) })}
+                    </span>
+                  ),
+                });
+              }
+              if (r.lastFiredAt) {
+                meta.push({
+                  key: "fired",
+                  node: (
+                    <span className="text-ink3">
+                      {t("agent.reminderLastFired", { time: shortDateTime(r.lastFiredAt, locale) })}
+                    </span>
+                  ),
+                });
+              }
+              return (
+                <WorkRow
+                  key={r.id}
+                  dot={status.dot}
+                  dotLabel={t(status.labelKey)}
+                  label={r.body}
+                  action={t("reminder.cancel")}
+                  actionLabel={t("reminder.cancelLabel", { body: r.body })}
+                  ask={t("reminder.cancelAsk")}
+                  confirm={t("reminder.cancelYes")}
+                  danger
+                  run={() => api.cancelReminder(agentId, r.id)}
+                  onDone={() => onDropped("reminders", r.id)}
+                  detail={
+                    <>
+                      {meta.map((part, index) => (
+                        <span key={part.key}>
+                          {index > 0 ? <span className="text-ink3">{" · "}</span> : null}
+                          {part.node}
+                        </span>
+                      ))}
+                      {r.check ? (
+                        <span className="selectable mt-0.5 block truncate font-mono text-ink3" title={r.check.command}>
+                          <span className="sr-only">{t("agent.reminderCheck")} </span>
+                          {r.check.command}
+                        </span>
+                      ) : null}
+                      {failureSummary ? (
+                        <span
+                          className={`mt-0.5 block line-clamp-2 wrap-anywhere ${status.problem === "failing" ? "text-red" : "text-amber"}`}
+                          title={failureSummary}
+                        >
+                          {failureSummary}
+                        </span>
+                      ) : null}
+                    </>
+                  }
+                  aside={
+                    status.problem === "failing" ? (
+                      <span
+                        className="shrink-0 whitespace-nowrap rounded-full border border-red-line bg-red-tint px-2 py-0.5 text-caption text-red"
+                        title={failureSummary ?? undefined}
+                      >
+                        {t("agent.reminderCheckFailing")}
                       </span>
-                    ) : null}
-                  </>
-                }
-              />
-            ))}
+                    ) : undefined
+                  }
+                />
+              );
+            })}
           </Group>
         )}
       </Section>
     </>
   );
-}
+});
 
 /**
  * A task or reminder. The agent owns them; the owner's one action (close, cancel) stays out of the
  * way until the row is hovered or focused, and asks once in place, since it cannot be undone.
  */
+/** The line icon: a short arrow off to the side, for work done beside the conversation. */
+function LineIcon() {
+  return (
+    <svg aria-hidden width="12" height="12" viewBox="0 0 12 12" fill="none" className="shrink-0">
+      <path
+        d="M2 2.5v3.5a2 2 0 0 0 2 2h5.5M7.5 6l2 2-2 2"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/** How long something has been under way, in minutes or hours. */
+function since(ms: number, t: Translate): string {
+  const minutes = Math.max(1, Math.round((Date.now() - ms) / 60_000));
+  return minutes < 60
+    ? t("line.minutes", { count: String(minutes) })
+    : t("line.hours", { count: String(Math.round(minutes / 60)) });
+}
+
+/**
+ * A piece of work the agent does beside the conversation (docs/spec.md 4.13): where it came from,
+ * where it stands, and a way to stop it. Finished work shows what it reported.
+ */
+function LineRow({ agentId, task, onDropped }: { agentId: string; task: Task; onDropped: () => void }) {
+  const { t } = useI18n();
+  const state = task.line ?? "waiting";
+  const active = state !== "done" && state !== "stopped";
+  const status =
+    state === "running" ? `${t("line.running", { time: since(task.createdAt, t) })}` : t(`line.${state}` as MessageKey);
+  const detail = (
+    <span className="flex min-w-0 flex-col gap-0.5">
+      {task.from ? (
+        <span className="flex min-w-0 items-center gap-1">
+          {task.from.platform ? <PlatformIcon platform={task.from.platform} size={12} /> : null}
+          <span className="truncate">
+            {task.from.platform === "local" ? t("privateChat.title") : (task.from.name ?? t("chat.dm"))}
+          </span>
+        </span>
+      ) : null}
+      {active && state !== "error" && task.progress ? (
+        <span className="truncate text-ink3" title={task.progress}>
+          {task.progress}
+        </span>
+      ) : null}
+      {state === "done" && task.summary ? (
+        <span className="line-clamp-2 text-ink3" title={task.summary}>
+          {task.summary}
+        </span>
+      ) : null}
+      {state === "error" && task.error ? <span className="line-clamp-2 text-red">{task.error}</span> : null}
+    </span>
+  );
+  const workStatus = taskStatus(task);
+  const tag = (
+    <span
+      className={`shrink-0 whitespace-nowrap rounded-full px-2 py-0.5 text-caption ${state === "error" ? "border border-red-line bg-red-tint text-red" : state === "done" ? "border border-line2 text-green" : "bg-bg3 text-ink2"}`}
+    >
+      {status}
+    </span>
+  );
+  return active ? (
+    <WorkRow
+      dot={workStatus.dot}
+      dotLabel={t(workStatus.labelKey)}
+      label={task.title}
+      detail={detail}
+      aside={tag}
+      action={t("line.stop")}
+      actionLabel={t("line.stopLabel", { title: task.title })}
+      ask={t("line.stopAsk")}
+      confirm={t("line.stop")}
+      run={() => api.closeTask(agentId, task.id)}
+      onDone={onDropped}
+    />
+  ) : (
+    <WorkRow dot={workStatus.dot} dotLabel={t(workStatus.labelKey)} label={task.title} detail={detail} aside={tag} />
+  );
+}
+
 function WorkRow({
+  dot,
+  dotLabel,
   label,
   detail,
   aside,
@@ -992,16 +1284,19 @@ function WorkRow({
   run,
   onDone,
 }: {
+  dot?: WorkDot;
+  dotLabel?: string;
   label: string;
   detail?: ReactNode;
   aside?: ReactNode;
-  action: string;
-  actionLabel: string;
-  ask: string;
-  confirm: string;
+  /** Absent for a row the owner has nothing to do on (finished work). */
+  action?: string;
+  actionLabel?: string;
+  ask?: string;
+  confirm?: string;
   danger?: boolean;
-  run: () => Promise<unknown>;
-  onDone: () => void;
+  run?: () => Promise<unknown>;
+  onDone?: () => void;
 }) {
   const { t } = useI18n();
   const [confirming, setConfirming] = useState(false);
@@ -1015,16 +1310,53 @@ function WorkRow({
   }, [confirming]);
   return (
     <GroupRow
-      className={`group relative min-h-[44px] flex-wrap transition-colors duration-[120ms] ${confirming ? (danger ? "bg-red-tint" : "bg-bg2") : ""}`}
+      compact
+      align="start"
+      className={`group relative flex-wrap transition-colors duration-[120ms] ${confirming ? (danger ? "bg-red-tint" : "bg-bg2") : ""}`}
     >
-      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="line-clamp-2 wrap-anywhere" title={label}>
-          {label}
+      <span className="flex min-w-0 flex-1 items-start gap-2.5">
+        {dot ? (
+          <span className="flex h-[1lh] shrink-0 items-center" title={dotLabel}>
+            <StatusDot state={dot} />
+            {dotLabel ? <span className="sr-only">{dotLabel}</span> : null}
+          </span>
+        ) : null}
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span className="flex min-w-0 items-start gap-2">
+            <span className="min-w-0 flex-1 line-clamp-2 wrap-anywhere" title={label}>
+              {label}
+            </span>
+            {!confirming ? (
+              <>
+                {aside}
+                {/* Over the row's end on hover or focus, so it takes no room from the text otherwise. */}
+                {action ? (
+                  <span className="pointer-events-none absolute top-2 right-3 bg-card pl-1 opacity-0 shadow-[-14px_0_10px_-2px_var(--color-card)] transition-opacity duration-[120ms] group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:static [@media(hover:none)]:-my-1 [@media(hover:none)]:opacity-100 [@media(hover:none)]:shadow-none">
+                    <Button
+                      ref={actionButton}
+                      small
+                      variant="ghost"
+                      aria-label={actionLabel}
+                      onClick={() => setConfirming(true)}
+                    >
+                      {action}
+                    </Button>
+                  </span>
+                ) : null}
+              </>
+            ) : null}
+          </span>
+          {detail ? <span className="text-caption text-ink2">{detail}</span> : null}
         </span>
-        {detail ? <span className="text-caption text-ink2">{detail}</span> : null}
       </span>
       {confirming ? (
-        <span className="flex w-full items-center justify-end gap-1.5">
+        // biome-ignore lint/a11y/noStaticElementInteractions: Escape backs out of the question it belongs to
+        <span
+          className="flex w-full items-center justify-end gap-1.5"
+          onKeyDown={onEscape(() => {
+            if (!busy) setConfirming(false);
+          })}
+        >
           <span className="sr-only">{ask}</span>
           <Button
             small
@@ -1034,11 +1366,11 @@ function WorkRow({
               setBusy(true);
               setFailure(null);
               try {
-                await run();
-                onDone();
+                await run?.();
+                onDone?.();
               } catch (error) {
                 // Already gone (the agent got there first): the list catches up.
-                if (error instanceof ApiError && error.status === 404) onDone();
+                if (error instanceof ApiError && error.status === 404) onDone?.();
                 else setFailure(errorText(t, error));
                 setConfirming(false);
               } finally {
@@ -1048,27 +1380,11 @@ function WorkRow({
           >
             {confirm}
           </Button>
-          <Button small variant="ghost" disabled={busy} onClick={() => setConfirming(false)}>
+          <Button small variant="ghost" autoFocus disabled={busy} onClick={() => setConfirming(false)}>
             {t("work.keep")}
           </Button>
         </span>
-      ) : (
-        <>
-          {aside}
-          {/* Over the row's end on hover or focus, so it takes no room from the text otherwise. */}
-          <span className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 bg-card pl-1 opacity-0 shadow-[-14px_0_10px_-2px_var(--color-card)] transition-opacity duration-[120ms] group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:static [@media(hover:none)]:translate-y-0 [@media(hover:none)]:opacity-100 [@media(hover:none)]:shadow-none">
-            <Button
-              ref={actionButton}
-              small
-              variant="ghost"
-              aria-label={actionLabel}
-              onClick={() => setConfirming(true)}
-            >
-              {action}
-            </Button>
-          </span>
-        </>
-      )}
+      ) : null}
       {failure ? <p className="w-full text-caption text-red">{failure}</p> : null}
     </GroupRow>
   );
@@ -1118,17 +1434,24 @@ function RoleEditor({ agent, onSaved }: { agent: AgentView; onSaved: () => void 
       }
     >
       {editing ? (
-        <div className="flex flex-col gap-2">
+        <form
+          className="flex flex-col gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void save();
+          }}
+          onKeyDown={onEscape(() => setEditing(false))}
+        >
           <Textarea autoFocus rows={6} value={draft} onChange={(e) => setDraft(e.target.value)} />
           <div className="flex gap-2">
-            <Button variant="primary" small onClick={save}>
+            <Button type="submit" variant="primary" small>
               {t("agent.save")}
             </Button>
             <Button variant="ghost" small onClick={() => setEditing(false)}>
               {t("agent.cancel")}
             </Button>
           </div>
-        </div>
+        </form>
       ) : agent.role.trim() ? (
         <div className="selectable rounded-card border border-line bg-card px-4 py-3 whitespace-pre-wrap wrap-anywhere">
           {agent.role.trim()}
@@ -1152,10 +1475,48 @@ function RoleEditor({ agent, onSaved }: { agent: AgentView; onSaved: () => void 
   );
 }
 
+/**
+ * The SSH host stopped answering. What the page shows is from the last connection; after a
+ * remote reboot the host is prepared again here, in place.
+ */
+function Unreachable({ id, onReady }: { id: string; onReady: () => Promise<void> | void }) {
+  const { t } = useI18n();
+  const { hosts } = useSshHosts();
+  const host = hosts.find((item) => item.id === id);
+  const [open, setOpen] = useState(false);
+  if (host && open)
+    return (
+      <SshSetup
+        host={host}
+        lead={t("ssh.unreachable")}
+        disabled={false}
+        onCancel={() => setOpen(false)}
+        onReady={() => {
+          setOpen(false);
+          void onReady();
+        }}
+      />
+    );
+  return (
+    <div role="status" className="flex flex-col gap-3 rounded-control border border-line bg-bg2 p-3">
+      <p className="text-small text-ink2">{t("ssh.unreachable")}</p>
+      {host ? (
+        <Button small className="self-start" onClick={() => setOpen(true)}>
+          {t("ssh.reconnect")}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 /** Which harness and model drive the agent. A change applies from the next message. */
 function Brain({ agent, onSaved }: { agent: AgentView; onSaved: () => void }) {
   const { t } = useI18n();
-  const { value: harnesses } = useCached<Harness[]>("harnesses", api.harnesses, []);
+  const { value: harnesses } = useCached<Harness[]>(
+    `harnesses:${agent.remote?.id ?? "local"}`,
+    () => api.harnesses(agent.remote?.id),
+    [],
+  );
   const [state, setState] = useState<"idle" | "saving" | "saved">("idle");
   const [error, setError] = useState<string | null>(null);
   async function save(patch: { harness?: string; model?: string | null }) {
@@ -1182,6 +1543,15 @@ function Brain({ agent, onSaved }: { agent: AgentView; onSaved: () => void }) {
   return (
     <Section title={t("create.brain")}>
       <Group>
+        {agent.remote ? (
+          <GroupRow>
+            <span className="min-w-0 flex-1">{t("ssh.location")}</span>
+            <span className="flex min-w-0 flex-col items-end text-right">
+              <span className="selectable max-w-full wrap-anywhere text-ink2">{agent.remote.host}</span>
+              <span className="text-caption text-ink3">{t("ssh.independent")}</span>
+            </span>
+          </GroupRow>
+        ) : null}
         <GroupRow>
           {current ? <HarnessIcon harness={current} size={24} /> : null}
           <span className="min-w-0 flex-1">{t("brain.harness")}</span>
@@ -1304,6 +1674,37 @@ function DeleteRow({
  * Start the agent over in a new session, for a session that is stuck or muddled. Its history is
  * gone afterwards, so it asks in place first (DESIGN.md: no modal dialogs).
  */
+/** The daily memory tidy-up (docs/spec.md 4.5): one switch, on by default. */
+function TidyRow({ agent, onChanged }: { agent: AgentView; onChanged: () => unknown }) {
+  const { t } = useI18n();
+  const [failure, setFailure] = useState<string | null>(null);
+  return (
+    <GroupRow className="flex-wrap">
+      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span>{t("agent.tidyTitle")}</span>
+          <span className="text-caption text-ink2">{t("agent.tidyBody", { name: agent.name })}</span>
+        </span>
+        <input
+          type="checkbox"
+          className="size-4 shrink-0 accent-[var(--accent-btn)]"
+          checked={agent.tidy}
+          onChange={async (e) => {
+            setFailure(null);
+            try {
+              await api.setTidy(agent.id, e.target.checked);
+            } catch (error) {
+              setFailure(errorText(t, error));
+            }
+            await onChanged();
+          }}
+        />
+      </label>
+      {failure ? <p className="w-full text-caption text-red">{failure}</p> : null}
+    </GroupRow>
+  );
+}
+
 function ResetRow({ agent, busy, disabled }: { agent: AgentView; busy: boolean; disabled: boolean }) {
   const { t } = useI18n();
   const [confirming, setConfirming] = useState(false);
@@ -1479,95 +1880,732 @@ function MessageActions({
   );
 }
 
-function ActivityList({
+/** A conversation row in the activity: a chat, or a channel with the threads under it. */
+interface ConversationNode {
+  key: string;
+  platform: Activity["platform"];
+  /** The chat itself; absent for a channel only its threads spoke in. */
+  own?: Conversation;
+  head: Conversation["chat"];
+  threads: Conversation[];
+  latestAt: number;
+}
+
+/** Threads go under their channel; the rows are newest first (DESIGN.md "Agent · 动态"). */
+function conversationTree(conversations: Conversation[]): ConversationNode[] {
+  const nodes = new Map<string, ConversationNode>();
+  for (const c of conversations.filter((c) => !c.parent)) {
+    nodes.set(c.chat.id, {
+      key: c.chat.id,
+      platform: c.platform,
+      own: c,
+      head: c.chat,
+      threads: [],
+      latestAt: c.latestAt,
+    });
+  }
+  for (const c of conversations.filter((c) => c.parent)) {
+    const parent = c.parent as NonNullable<Conversation["parent"]>;
+    const node = nodes.get(parent.id) ?? {
+      key: parent.id,
+      platform: c.platform,
+      head: parent,
+      threads: [],
+      latestAt: 0,
+    };
+    node.threads.push(c);
+    node.latestAt = Math.max(node.latestAt, c.latestAt);
+    nodes.set(parent.id, node);
+  }
+  for (const node of nodes.values()) node.threads.sort((a, b) => b.latestAt - a.latestAt);
+  return [...nodes.values()].sort((a, b) => b.latestAt - a.latestAt);
+}
+
+/** How many of these messages still need the owner, by what they need. */
+function needs(messages: Activity[]): { failed: number; unanswered: number; held: number } {
+  const inbound = messages.filter((m) => m.direction === "in");
+  return {
+    failed: inbound.filter((m) => m.state === "failed").length,
+    unanswered: inbound.filter((m) => m.state === "unanswered").length,
+    held: inbound.filter((m) => m.state === "held").length,
+  };
+}
+
+const ActivityList = memo(function ActivityList({
   agent,
-  items,
+  conversations,
   handoffs,
+  onRetry,
+  onIgnore,
+  onOpenChat,
+}: {
+  agent: AgentView;
+  conversations: Conversation[];
+  handoffs: HandoffView[];
+  onRetry: (ids: string[]) => Promise<void>;
+  onIgnore: (ids: string[]) => Promise<void>;
+  /** The private chat is read where it is written: its row opens it. */
+  onOpenChat: () => void;
+}) {
+  const nodes = useMemo(() => conversationTree(conversations), [conversations]);
+  // The newest conversation opens by itself: what just happened reads at once, as the timeline did.
+  // Not the private chat: it opens on its own tab.
+  const newest = useMemo(() => nodes.find((n) => n.platform !== "local"), [nodes]);
+  const [open, setOpen] = useState<Set<string>>(() => new Set(newest ? [newest.key] : []));
+  const seeded = useRef(Boolean(newest));
+  useEffect(() => {
+    if (seeded.current || !newest) return;
+    seeded.current = true;
+    setOpen(new Set([newest.key]));
+  }, [newest]);
+  const toggle = useCallback(
+    (key: string) =>
+      setOpen((current) => {
+        const next = new Set(current);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      }),
+    [],
+  );
+  // Handoffs go in among the conversations by time, no further back than the conversations shown reach.
+  const rows = useMemo(() => {
+    const oldest = conversations.length >= 20 ? Math.min(...conversations.map((c) => c.latestAt)) : 0;
+    const items: (
+      | { kind: "chat"; at: number; node: ConversationNode }
+      | { kind: "handoff"; at: number; h: HandoffView }
+    )[] = [
+      ...nodes.map((node) => ({ kind: "chat" as const, at: node.latestAt, node })),
+      ...handoffs.filter((h) => h.createdAt >= oldest).map((h) => ({ kind: "handoff" as const, at: h.createdAt, h })),
+    ];
+    return items.sort((a, b) => b.at - a.at);
+  }, [conversations, handoffs, nodes]);
+  // Like a Mac list: ↑↓ move between rows, → opens, ← closes.
+  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const row = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-conversation]");
+    if (!row || event.nativeEvent.isComposing) return;
+    const all = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("[data-conversation]")];
+    const i = all.indexOf(row);
+    const key = row.dataset.conversation as string;
+    if (event.key === "ArrowDown") all[i + 1]?.focus();
+    else if (event.key === "ArrowUp") all[i - 1]?.focus();
+    else if (event.key === "ArrowRight" && !open.has(key)) toggle(key);
+    else if (event.key === "ArrowLeft" && open.has(key)) toggle(key);
+    else return;
+    event.preventDefault();
+  };
+  return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: arrow keys move between the row buttons inside
+    <div onKeyDown={onKeyDown}>
+      <Group>
+        {rows.map((row) =>
+          row.kind === "handoff" ? (
+            <HandoffItem key={row.h.id} handoff={row.h} agent={agent} />
+          ) : (
+            <ConversationRow
+              key={row.node.key}
+              agent={agent}
+              node={row.node}
+              expanded={open.has(row.node.key)}
+              openThreads={
+                row.node.threads.length
+                  ? row.node.threads
+                      .filter((th) => open.has(th.chat.id))
+                      .map((th) => th.chat.id)
+                      .join("\0")
+                  : ""
+              }
+              onToggle={row.node.platform === "local" ? onOpenChat : toggle}
+              onRetry={onRetry}
+              onIgnore={onIgnore}
+            />
+          ),
+        )}
+      </Group>
+    </div>
+  );
+});
+
+const ConversationRow = memo(function ConversationRow({
+  agent,
+  node,
+  expanded,
+  openThreads,
+  onToggle,
   onRetry,
   onIgnore,
 }: {
   agent: AgentView;
-  items: Activity[];
-  handoffs: HandoffView[];
+  node: ConversationNode;
+  expanded: boolean;
+  /** Null-delimited ids of expanded child threads; scalar prop keeps memo hits when another row toggles. */
+  openThreads: string;
+  onToggle: (key: string) => void;
+  onRetry: (ids: string[]) => Promise<void>;
+  onIgnore: (ids: string[]) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const openThreadSet = useMemo(() => (openThreads ? new Set(openThreads.split("\0")) : null), [openThreads]);
+  const all = useMemo(
+    () => [...(node.own?.messages ?? []), ...node.threads.flatMap((c) => c.messages)],
+    [node.own, node.threads],
+  );
+  const kind = node.head.kind;
+  const title =
+    node.platform === "local"
+      ? t("privateChat.title")
+      : kind === "dm"
+        ? (node.own &&
+            personLabel(
+              t,
+              node.own.messages.find((m) => m.direction === "in"),
+            )) ||
+          node.head.name ||
+          t("chat.dm")
+        : node.head.name || t(kind === "thread" ? "chat.thread" : "chat.group");
+  const where = [
+    t(kind === "dm" ? "chat.dm" : kind === "thread" ? "chat.thread" : "chat.group"),
+    ...(node.threads.length ? [t("activity.threads", { count: String(node.threads.length) })] : []),
+  ].join(" · ");
+  const preview = node.own?.messages.length ? node.own.messages : (node.threads[0]?.messages ?? []);
+  return (
+    <div>
+      <ConversationHead
+        id={node.key}
+        icon={<PlatformIcon platform={node.platform} size={20} />}
+        title={title}
+        where={where}
+        messages={all}
+        latestAt={node.latestAt}
+        expanded={expanded}
+        preview={preview}
+        dm={kind === "dm"}
+        onToggle={onToggle}
+      />
+      {expanded ? (
+        <div className="rise">
+          {node.own ? (
+            <ConversationMessages agent={agent} conversation={node.own} onRetry={onRetry} onIgnore={onIgnore} />
+          ) : null}
+          {node.threads.map((thread) => {
+            const threadOpen = openThreadSet?.has(thread.chat.id) ?? false;
+            return (
+              <div key={thread.chat.id} className="ml-12 border-t border-line">
+                <ConversationHead
+                  id={thread.chat.id}
+                  thread
+                  icon={
+                    <span className="flex size-5 shrink-0 items-center justify-center rounded-small border border-line2 text-ink3">
+                      <ThreadIcon />
+                    </span>
+                  }
+                  title={thread.chat.name || t("chat.thread")}
+                  where={t("chat.thread")}
+                  messages={thread.messages}
+                  latestAt={thread.latestAt}
+                  expanded={threadOpen}
+                  preview={thread.messages}
+                  onToggle={onToggle}
+                />
+                {threadOpen ? (
+                  <div className="rise">
+                    <ConversationMessages
+                      agent={agent}
+                      conversation={thread}
+                      thread
+                      onRetry={onRetry}
+                      onIgnore={onIgnore}
+                    />
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+});
+
+/** A conversation's row: where, what still needs the owner, when, and, closed, the last exchange. */
+function ConversationHead({
+  id,
+  icon,
+  title,
+  where,
+  messages,
+  latestAt,
+  expanded,
+  preview,
+  thread = false,
+  dm = false,
+  onToggle,
+}: {
+  id: string;
+  icon: ReactNode;
+  title: string;
+  where: string;
+  messages: Activity[];
+  latestAt: number;
+  expanded: boolean;
+  preview: Activity[];
+  thread?: boolean;
+  dm?: boolean;
+  onToggle: (key: string) => void;
+}) {
+  const { t, locale } = useI18n();
+  const need = needs(messages);
+  // The last thing said and, when the agent answered it, the answer under it.
+  const last = preview.at(-1);
+  const asked = [...preview].reverse().find((m) => m.direction === "in");
+  const exchange = last ? (last.direction === "out" && asked ? [asked, last] : [last]) : [];
+  return (
+    <button
+      type="button"
+      data-conversation={id}
+      aria-expanded={expanded}
+      onClick={() => onToggle(id)}
+      className={`flex w-full gap-3 py-3 pr-4 text-left hover:bg-bg3 ${thread ? "" : "pl-4"}`}
+    >
+      {icon}
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="flex min-w-0 items-baseline gap-2 text-small">
+          <span className="min-w-0 max-w-[60%] shrink truncate font-semibold" title={title}>
+            {title}
+          </span>
+          {/* Narrow rows keep the name and what needs the owner; the kind of chat is the first to go. */}
+          <span className="hidden min-w-0 flex-1 truncate text-ink3 min-[640px]:block">{where}</span>
+          <span className="flex-1 min-[640px]:hidden" />
+          {need.failed ? (
+            <span className="shrink-0 whitespace-nowrap rounded-small border border-red-line bg-red-tint px-1.5 text-caption text-red">
+              {t("activity.failedCount", { count: String(need.failed) })}
+            </span>
+          ) : null}
+          {need.unanswered ? (
+            <span className="shrink-0 whitespace-nowrap rounded-small border border-amber-line bg-amber-tint px-1.5 text-caption text-amber">
+              {t("activity.unansweredCount", { count: String(need.unanswered) })}
+            </span>
+          ) : null}
+          {need.held ? (
+            <span className="shrink-0 whitespace-nowrap rounded-small border border-amber-line bg-amber-tint px-1.5 text-caption text-amber">
+              {t("agent.held")}
+            </span>
+          ) : null}
+          <span className="shrink-0 whitespace-nowrap text-caption text-ink3">{relativeTime(latestAt, locale)}</span>
+        </span>
+        {expanded
+          ? null
+          : exchange.map((m, i) => (
+              <span key={m.id} className="flex min-w-0 gap-1 text-small text-ink2">
+                {i ? (
+                  <svg
+                    aria-hidden
+                    width="12"
+                    height="12"
+                    viewBox="0 0 12 12"
+                    fill="none"
+                    className="mt-0.5 shrink-0 text-ink3"
+                  >
+                    <path
+                      d="M3 1.5v4A2.5 2.5 0 0 0 5.5 8H10"
+                      stroke="currentColor"
+                      strokeWidth="1.3"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                ) : null}
+                {/* In a direct chat the row already names the person: only the agent's turn is labelled. */}
+                {dm && m.direction === "in" ? null : (
+                  <span className={`shrink-0 ${m.direction === "in" ? "text-ink" : ""}`}>
+                    {t("activity.said", { name: m.direction === "out" ? (m.sender ?? "") : personLabel(t, m) })}
+                  </span>
+                )}
+                <span className="min-w-0 truncate">{m.body.replace(/\s+/g, " ") || m.files.join(", ")}</span>
+              </span>
+            ))}
+      </span>
+      <DisclosureIcon
+        className={`mt-1 text-ink3 transition-transform duration-[180ms] ${expanded ? "" : "-rotate-90"}`}
+      />
+    </button>
+  );
+}
+
+/** Who said it: their name, "you" when it cannot mean two people, or a stable label. */
+function personLabel(t: Translate, m: Activity | undefined): string {
+  if (!m) return "";
+  return (
+    m.sender ??
+    (m.senderIsOnlyOwner
+      ? t("activity.you")
+      : m.contactId
+        ? t("activity.unnamed", { id: m.contactId })
+        : t("activity.someone"))
+  );
+}
+
+/**
+ * Whether the agent hears everything said in this group, or only what is addressed to it
+ * (docs/spec.md 4.2). Shown where the chat app sends the bot every message in its groups.
+ */
+function ListenSwitch({ agent, conversation }: { agent: AgentView; conversation: Conversation }) {
+  const { t } = useI18n();
+  const [on, setOn] = useState(Boolean(conversation.listen));
+  const [saving, setSaving] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  // A poll that brings another answer (the owner changed it elsewhere) wins once nothing is saving.
+  useEffect(() => {
+    if (!saving) setOn(Boolean(conversation.listen));
+  }, [conversation.listen, saving]);
+  // What the agent set: shown until the next poll brings the owner's reset back.
+  const [hearing, setHearing] = useState(conversation.hearing);
+  useEffect(() => setHearing(conversation.hearing), [conversation.hearing]);
+  // Tier, names and status come from 0.4.7 on: a host on an older Mingle shows the switch and pace only.
+  const settings = hearingSettings(hearing);
+  const duration = (ms: number) => {
+    const minutes = Math.max(1, Math.round(ms / 60_000));
+    if (minutes % 1440 === 0) return t("listen.days", { count: String(minutes / 1440) });
+    return minutes % 60 === 0
+      ? t("listen.hours", { count: String(minutes / 60) })
+      : t("line.minutes", { count: String(minutes) });
+  };
+  const pace =
+    !on || !hearing
+      ? null
+      : hearing.pace === "muted"
+        ? t("listen.muted", { name: agent.name })
+        : hearing.pace === "every"
+          ? t("listen.every", { name: agent.name, duration: duration(hearing.everyMs ?? 0) })
+          : hearing.slowedMs
+            ? t("listen.slowed", { name: agent.name, duration: duration(hearing.slowedMs) })
+            : null;
+  return (
+    <div className="mb-1 flex flex-col gap-1 border-b border-line pb-2.5">
+      <label className="flex min-w-0 cursor-pointer items-start gap-3">
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span className="text-small font-medium">{t("listen.title")}</span>
+          <span className="text-caption text-ink2">{t(on ? "listen.on" : "listen.off", { name: agent.name })}</span>
+        </span>
+        <input
+          type="checkbox"
+          className="mt-0.5 size-4 shrink-0 accent-[var(--accent-btn)]"
+          checked={on}
+          disabled={saving}
+          onChange={async (e) => {
+            const next = e.target.checked;
+            setOn(next);
+            setSaving(true);
+            setFailure(null);
+            try {
+              await api.setListen(agent.id, conversation.chat.id, next);
+            } catch (error) {
+              setOn(!next);
+              setFailure(errorText(t, error));
+            } finally {
+              setSaving(false);
+            }
+          }}
+        />
+      </label>
+      {on && settings ? (
+        <HearingRows
+          agent={agent}
+          chatId={conversation.chat.id}
+          hearing={settings}
+          saving={saving}
+          onSave={async (save) => {
+            setSaving(true);
+            setFailure(null);
+            try {
+              setHearing(await save());
+              return true;
+            } catch (error) {
+              setFailure(errorText(t, error));
+              return false;
+            } finally {
+              setSaving(false);
+            }
+          }}
+        />
+      ) : null}
+      {on && settings && !pace ? (
+        <p className="flex items-start gap-1.5 pr-7 text-caption text-ink2">
+          <span className="flex h-[1lh] shrink-0 items-center">
+            <StatusDot state={settings.live.length > 0 ? "idle" : "offline"} />
+          </span>
+          {settings.live.length > 0
+            ? t("listen.live", { names: settings.live.join(t("listen.namesJoin")) })
+            : t("listen.overhearing")}
+        </p>
+      ) : null}
+      {pace ? (
+        <p className="pr-7 text-caption text-ink2">
+          {pace}
+          {hearing && hearing.pace !== "auto" ? (
+            <>
+              {" "}
+              <button
+                type="button"
+                className="font-medium text-accent hover:underline disabled:opacity-45"
+                disabled={saving}
+                onClick={async () => {
+                  setSaving(true);
+                  setFailure(null);
+                  try {
+                    setHearing(await api.resetHearing(agent.id, conversation.chat.id));
+                  } catch (error) {
+                    setFailure(errorText(t, error));
+                  } finally {
+                    setSaving(false);
+                  }
+                }}
+              >
+                {t("listen.reset")}
+              </button>
+            </>
+          ) : null}
+        </p>
+      ) : null}
+      {failure ? <p className="text-caption text-red">{failure}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * Under "hear every message" (docs/spec.md 4.2): how fast it keeps up with a conversation, the owner's
+ * one knob on what that costs, and the names the group calls it by.
+ */
+function HearingRows({
+  agent,
+  chatId,
+  hearing,
+  saving,
+  onSave,
+}: {
+  agent: AgentView;
+  chatId: string;
+  hearing: HearingSettings;
+  saving: boolean;
+  onSave: (save: () => Promise<Hearing>) => Promise<boolean>;
+}) {
+  const { t } = useI18n();
+  const [adding, setAdding] = useState<string | null>(null);
+  const tier = hearing.tier ?? hearing.defaultTier;
+  const tiers: HearTier[] = ["save", "balanced", "fast"];
+  const add = async () => {
+    const name = adding?.trim();
+    if (!name) return setAdding(null);
+    if (await onSave(() => api.alias(agent.id, chatId, name, true))) setAdding(null);
+  };
+  return (
+    <div className="mt-1 mb-0.5 flex flex-col gap-2">
+      <div className="flex min-w-0 flex-wrap items-start gap-x-3 gap-y-1.5">
+        <span className="flex min-w-0 flex-1 basis-56 flex-col gap-0.5">
+          <span className="text-small font-medium">{t("listen.tier.title")}</span>
+          <span className="text-caption text-ink2">
+            {t(`listen.tier.${tier}Text`)}
+            {hearing.tier === null
+              ? ` ${t(hearing.defaultTier === "fast" ? "listen.tier.smallDefault" : "listen.tier.bigDefault")}`
+              : ""}
+          </span>
+        </span>
+        <Segmented
+          label={t("listen.tier.title")}
+          value={tier}
+          options={tiers.map((value) => ({ value, label: t(`listen.tier.${value}`) }))}
+          onChange={(value) => {
+            if (saving || value === tier) return;
+            // The tier the group's size gives it is kept as "follow the size", so it moves with the group.
+            void onSave(() => api.setHearTier(agent.id, chatId, value === hearing.defaultTier ? null : value));
+          }}
+        />
+      </div>
+      <div className="flex min-w-0 flex-col gap-1">
+        <span className="text-small font-medium">{t("listen.names.title")}</span>
+        <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <span className="max-w-full truncate rounded-full bg-bg3 px-2 py-0.5 text-caption text-ink2">
+            {agent.name}
+          </span>
+          {hearing.aliases.map((alias) => (
+            <span
+              key={alias}
+              className="inline-flex max-w-full min-w-0 items-center gap-1 rounded-full border border-line2 py-0.5 pr-1 pl-2 text-caption"
+            >
+              <span className="truncate">{alias}</span>
+              <button
+                type="button"
+                aria-label={t("listen.names.remove", { name: alias })}
+                disabled={saving}
+                className="grid size-4 shrink-0 place-items-center rounded-full text-ink3 hover:bg-bg3 hover:text-ink disabled:opacity-45"
+                onClick={() => void onSave(() => api.alias(agent.id, chatId, alias, false))}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+          {adding === null ? (
+            hearing.aliases.length < 8 ? (
+              <button
+                type="button"
+                disabled={saving}
+                className="text-caption font-medium text-accent hover:underline disabled:opacity-45"
+                onClick={() => setAdding("")}
+              >
+                {t("listen.names.add")}
+              </button>
+            ) : null
+          ) : (
+            <form
+              className="flex min-w-0 flex-wrap items-center gap-1.5"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void add();
+              }}
+            >
+              <Input
+                autoFocus
+                aria-label={t("listen.names.new")}
+                placeholder={t("listen.names.new")}
+                maxLength={16}
+                value={adding}
+                className="h-7 w-36 text-small"
+                onChange={(e) => setAdding(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setAdding(null);
+                }}
+              />
+              <Button small variant="primary" type="submit" disabled={saving || !adding.trim()}>
+                {t("listen.names.add")}
+              </Button>
+              <Button small variant="ghost" onClick={() => setAdding(null)}>
+                {t("listen.names.cancel")}
+              </Button>
+            </form>
+          )}
+        </span>
+        <span className="text-caption text-ink2">{t("listen.names.caption")}</span>
+      </div>
+    </div>
+  );
+}
+
+/** An open conversation, read top-down as it was said; earlier messages on request. */
+function ConversationMessages({
+  agent,
+  conversation,
+  thread = false,
+  onRetry,
+  onIgnore,
+}: {
+  agent: AgentView;
+  conversation: Conversation;
+  thread?: boolean;
   onRetry: (ids: string[]) => Promise<void>;
   onIgnore: (ids: string[]) => Promise<void>;
 }) {
   const { t, locale } = useI18n();
-  // Handoffs go in among the messages by time, no further back than the messages shown reach.
-  const oldest = items.length >= 30 ? Math.min(...items.map((m) => m.createdAt)) : 0;
-  const rows: ({ kind: "message"; at: number; m: Activity } | { kind: "handoff"; at: number; h: HandoffView })[] = [
-    ...items.map((m) => ({ kind: "message" as const, at: m.createdAt, m })),
-    ...handoffs.filter((h) => h.createdAt >= oldest).map((h) => ({ kind: "handoff" as const, at: h.createdAt, h })),
-  ].sort((a, b) => b.at - a.at);
+  const [older, setOlder] = useState<{ messages: Activity[]; earlier: number; cursor: number | null } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+  // What the last poll says wins: a message read earlier may have been retried or ignored since.
+  const fresh = new Map(conversation.messages.map((m) => [m.id, m]));
+  const messages = [...(older?.messages.filter((m) => !fresh.has(m.id)) ?? []), ...conversation.messages].sort(
+    (a, b) => a.createdAt - b.createdAt,
+  );
+  const earlier = older ? older.earlier : conversation.earlier;
+  const cursor = older ? older.cursor : conversation.cursor;
+  const loadEarlier = async () => {
+    if (cursor === null) return;
+    setLoading(true);
+    try {
+      const [page] = await api.conversations(agent.id, { chat: conversation.chat.id, before: cursor });
+      setOlder((current) => ({
+        messages: [...(page?.messages ?? []), ...(current?.messages ?? [])],
+        earlier: page?.earlier ?? 0,
+        cursor: page?.cursor ?? null,
+      }));
+      setFailed(false);
+    } catch {
+      setFailed(true);
+    } finally {
+      setLoading(false);
+    }
+  };
   return (
-    <Group>
-      {rows.map((row) => {
-        if (row.kind === "handoff") return <HandoffItem key={row.h.id} handoff={row.h} agent={agent} />;
-        const m = row.m;
-        // "You" only when it cannot be two people: two WeChat accounts are each an owner.
-        const who =
-          m.sender ??
-          (m.senderIsOnlyOwner
-            ? t("activity.you")
-            : m.contactId
-              ? t("activity.unnamed", { id: m.contactId })
-              : t("activity.someone"));
-        const where = m.chat.kind === "dm" ? t("chat.dm") : (m.chat.name ?? t("chat.group"));
-        return (
-          <div key={m.id} className={`flex gap-3 px-4 py-3 ${m.direction === "out" ? "bg-bg2" : ""}`}>
-            <PlatformIcon platform={m.platform} size={20} />
-            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-              <div className="flex items-baseline gap-2 text-small">
-                <span className="max-w-[45%] shrink-0 truncate font-semibold" title={who}>
-                  {who}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-ink3" title={where}>
-                  {where}
-                </span>
-                <span className="shrink-0 whitespace-nowrap text-caption text-ink3">
-                  {relativeTime(m.createdAt, locale)}
-                </span>
-              </div>
-              <p className="selectable line-clamp-4 whitespace-pre-wrap wrap-anywhere">{m.body}</p>
-              {m.files.length ? (
-                <p className="truncate font-mono text-caption text-ink2" title={m.files.join(", ")}>
-                  {m.files.join(", ")}
-                </p>
-              ) : null}
-              {m.direction === "in" && m.state === "unanswered" ? (
-                <p className="flex flex-wrap items-center gap-1.5 text-caption text-amber">
-                  <StatusDot state="awaiting_approval" />
-                  {t("agent.unanswered")}
-                  <MessageActions inline onRetry={() => onRetry([m.id])} onIgnore={() => onIgnore([m.id])} />
-                </p>
-              ) : null}
-              {m.direction === "in" && m.state === "waiting" ? (
-                <p className="flex flex-wrap items-center gap-1.5 text-caption text-ink2">
-                  <StatusDot state="reconnecting" />
-                  {m.retryAt ? t("agent.waitingUntil", { time: shortDateTime(m.retryAt, locale) }) : t("agent.waiting")}
-                  <MessageActions inline onRetry={() => onRetry([m.id])} onIgnore={() => onIgnore([m.id])} />
-                </p>
-              ) : null}
-              {m.direction === "in" && m.state === "failed" ? (
-                <p className="flex flex-wrap items-center gap-1.5 text-caption text-red">
-                  <StatusDot state="error" />
-                  {t("agent.failed")}
-                  <MessageActions inline onRetry={() => onRetry([m.id])} onIgnore={() => onIgnore([m.id])} />
-                </p>
-              ) : null}
-              {m.direction === "in" && m.state === "held" ? (
-                <p className="flex items-center gap-1.5 text-caption text-amber">
-                  <StatusDot state="awaiting_approval" />
-                  {t("agent.held")}
-                </p>
-              ) : null}
-              {m.direction === "in" && m.triggers && m.state === "ignored" ? (
-                <p className="text-caption text-ink3">{t("agent.ignored")}</p>
-              ) : null}
-            </div>
+    <div className={`flex flex-col pr-4 pb-3 ${thread ? "pl-8" : "pl-12"}`}>
+      {conversation.listen !== null ? <ListenSwitch agent={agent} conversation={conversation} /> : null}
+      {earlier > 0 && cursor !== null ? (
+        <button
+          type="button"
+          disabled={loading}
+          onClick={() => void loadEarlier()}
+          className={`mb-1 min-h-7 self-start text-caption font-medium hover:underline disabled:opacity-45 ${failed ? "text-red" : "text-accent"}`}
+        >
+          {failed ? t("activity.earlierFailed") : t("activity.earlier", { count: String(earlier) })}
+        </button>
+      ) : null}
+      {messages.map((m) => (
+        <div
+          key={m.id}
+          data-message={m.id}
+          className={`flex flex-col gap-0.5 ${m.direction === "out" ? "my-1 ml-4 border-l-2 border-line2 py-0.5 pl-3" : "py-1.5"}`}
+        >
+          <div className="flex min-w-0 items-baseline gap-2 text-small">
+            <span className="min-w-0 max-w-[60%] truncate font-semibold">
+              {m.direction === "out" ? m.sender : personLabel(t, m)}
+            </span>
+            <span className="shrink-0 whitespace-nowrap text-caption text-ink3">
+              {relativeTime(m.createdAt, locale)}
+            </span>
           </div>
-        );
-      })}
-    </Group>
+          <p className="selectable line-clamp-4 whitespace-pre-wrap wrap-anywhere">{m.body}</p>
+          {m.line && (m.line.started || m.direction === "in") ? (
+            <p className="flex min-w-0 items-center gap-1.5 text-caption text-ink3">
+              <LineIcon />
+              <span className="truncate">
+                {t(m.line.started ? "line.started" : "line.handed", { title: m.line.title })}
+                {" · "}
+                {m.line.state === "running" ? t("line.now") : t(`line.${m.line.state}` as MessageKey)}
+              </span>
+            </p>
+          ) : null}
+          {m.files.length ? (
+            <p className="truncate font-mono text-caption text-ink2" title={m.files.join(", ")}>
+              {m.files.join(", ")}
+            </p>
+          ) : null}
+          {m.direction === "in" && m.state === "unanswered" ? (
+            <p className="flex flex-wrap items-center gap-1.5 text-caption text-amber">
+              <StatusDot state="awaiting_approval" />
+              {t("agent.unanswered")}
+              <MessageActions inline onRetry={() => onRetry([m.id])} onIgnore={() => onIgnore([m.id])} />
+            </p>
+          ) : null}
+          {m.direction === "in" && m.state === "waiting" ? (
+            <p className="flex flex-wrap items-center gap-1.5 text-caption text-ink2">
+              <StatusDot state="reconnecting" />
+              {m.retryAt ? t("agent.waitingUntil", { time: shortDateTime(m.retryAt, locale) }) : t("agent.waiting")}
+              <MessageActions inline onRetry={() => onRetry([m.id])} onIgnore={() => onIgnore([m.id])} />
+            </p>
+          ) : null}
+          {m.direction === "in" && m.state === "failed" ? (
+            <p className="flex flex-wrap items-center gap-1.5 text-caption text-red">
+              <StatusDot state="error" />
+              {t("agent.failed")}
+              <MessageActions inline onRetry={() => onRetry([m.id])} onIgnore={() => onIgnore([m.id])} />
+            </p>
+          ) : null}
+          {m.direction === "in" && m.state === "held" ? (
+            <p className="flex items-center gap-1.5 text-caption text-amber">
+              <StatusDot state="awaiting_approval" />
+              {t("agent.held")}
+            </p>
+          ) : null}
+          {m.direction === "in" && m.triggers && m.state === "ignored" ? (
+            <p className="text-caption text-ink3">{t("agent.ignored")}</p>
+          ) : null}
+        </div>
+      ))}
+    </div>
   );
 }

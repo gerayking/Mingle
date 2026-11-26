@@ -226,7 +226,7 @@ describe("discord connection", () => {
     await until(() => received.length === 3, 1000);
     const byId = Object.fromEntries(received.map((m) => [m.platformId, m.chat]));
     expect(byId.M1).toEqual({ platformId: "C1", kind: "group", name: "Hikers #general" });
-    expect(byId.M2).toEqual({ platformId: "T9", kind: "thread", name: "Hikers #plans" });
+    expect(byId.M2).toEqual({ platformId: "T9", kind: "thread", name: "Hikers #plans", followUp: true });
     expect(byId.M3).toEqual({ platformId: "D1", kind: "dm" });
 
     // Discord asks for a reconnect: resume on the resume URL with the last sequence.
@@ -346,6 +346,41 @@ describe("discord connection", () => {
       message_reference: { message_id: "M1" },
     });
     expect((form.get("files[0]") as File).name).toBe("a.txt");
+    await connection.close();
+  });
+
+  it("opens a thread from a message for a line's work, and replies quoted where it cannot (docs/spec.md 4.13)", async () => {
+    let n = 0;
+    let allowed = true;
+    const http = fakeHttp({
+      ...identity,
+      "POST /channels/C1/messages/M1/threads": () =>
+        allowed ? { id: "M1" } : Response.json({ code: 50013, message: "Missing Permissions" }, { status: 403 }),
+      "POST /channels/M1/messages": () => ({ id: `T${++n}` }),
+      "POST /channels/C1/messages": () => ({ id: `R${++n}` }),
+    });
+    const ws = fakeSockets();
+    const connection = await discordChannel({ fetch: http.fetchImpl, createSocket: ws.createSocket }).connect(
+      { token: TOKEN },
+      { onMessage: () => {}, onState: () => {}, onMembership: () => {} },
+    );
+    expect(connection.capabilities().threads).toBe(true);
+    const chat = { platformId: "C1", kind: "group" as const };
+    const opened = await connection.send({ chat, text: "On it.", replyTo: "M1", inThread: { title: "Fix the login" } });
+    expect(opened).toEqual({
+      kind: "sent",
+      platformId: "T1",
+      thread: { platformId: "M1", kind: "thread", name: "#Fix the login", followUp: true },
+    });
+    expect(http.calls.find((c) => c.path === "/channels/C1/messages/M1/threads")?.body).toMatchObject({
+      name: "Fix the login",
+    });
+    // In the thread, not quoting the message it hangs under.
+    expect(http.calls.find((c) => c.path === "/channels/M1/messages")?.body).not.toHaveProperty("message_reference");
+
+    allowed = false;
+    const quoted = await connection.send({ chat, text: "On it.", replyTo: "M1", inThread: { title: "Fix" } });
+    expect(quoted).toEqual({ kind: "sent", platformId: "R2", degraded: ["thread_dropped"] });
     await connection.close();
   });
 

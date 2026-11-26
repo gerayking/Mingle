@@ -15,6 +15,7 @@ type texts struct {
 	starting, restarting, running, stopped   string
 	restartHint                              string
 	open, logs, openAtLogin, keepAwake, quit string
+	settings, newAgent                       string
 	noChatApps                               string
 	quitTitle, quitButton, cancel            string
 	closeHintTitle, closeHintBody            string
@@ -46,6 +47,8 @@ func zhTexts() texts {
 		openAtLogin:    "登录时打开",
 		keepAwake:      "插电时保持唤醒",
 		quit:           "退出 Mingle",
+		settings:       "设置…",
+		newAgent:       "新建 Agent",
 		noChatApps:     "还没有连接聊天软件",
 		quitTitle:      "退出 Mingle？",
 		quitButton:     "退出",
@@ -70,6 +73,8 @@ func enTexts() texts {
 		openAtLogin:    "Open at Login",
 		keepAwake:      "Stay Awake on Power",
 		quit:           "Quit Mingle",
+		settings:       "Settings…",
+		newAgent:       "New Agent",
 		noChatApps:     "No chat app connected",
 		quitTitle:      "Quit Mingle?",
 		quitButton:     "Quit",

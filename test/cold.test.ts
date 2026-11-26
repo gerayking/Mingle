@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type Runtime, UnsupportedOptionError } from "@botiverse/oar";
 import { type ScriptedTurn, scriptedRuntime } from "@botiverse/oar/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -230,8 +231,8 @@ describe("cold start in the runtime", () => {
   let runtime: AgentRuntime;
   let seq = 0;
 
-  const start = (rebuild: boolean) => {
-    const scripted = scriptedRuntime({
+  const start = (rebuild: boolean, refuseResume?: string) => {
+    const base = scriptedRuntime({
       turn: async (t: ScriptedTurn) => {
         const record = { input: t.input, resume: (t.options as { resume?: string }).resume, steered: [] as string[] };
         turns.push(record);
@@ -243,6 +244,14 @@ describe("cold start in the runtime", () => {
         t.say("ok");
       },
     });
+    // Like Pi with unregistered pending tools: the harness refuses to resume one saved session.
+    const scripted: Runtime = {
+      ...base,
+      session: (install, options) =>
+        refuseResume && options.resume === refuseResume
+          ? Promise.reject(new UnsupportedOptionError("resume", "fixture: cannot resume this session"))
+          : base.session(install, options),
+    };
     runtime = new AgentRuntime(agentId, {
       store,
       harness: oarHarness({ require: () => scripted }),
@@ -327,6 +336,25 @@ describe("cold start in the runtime", () => {
     expect(agent?.sessionId).not.toBe(oldSession);
     expect(store.previousSessionId(agentId)).toBe(oldSession);
     await until(() => logs.some((l) => l.includes("cold turn mode=rebuild")));
+  });
+
+  it("gives the agent a built context when its session could not be resumed", async () => {
+    // A harness that will not bring the saved conversation back (gone, or refused at resume)
+    // gets a new session: the agent picks up from its memory and recent chats, not from nothing.
+    store.setSessionId(agentId, "s-lost");
+    start(false, "s-lost");
+    const message = send("What time do we meet?");
+    await settled(1);
+    const input = turns[0]?.input ?? "";
+    expect(turns[0]?.resume).toBeUndefined();
+    expect(input).toContain("- Saturday hike: ridge route");
+    expect(input.indexOf(`msg=${message.id}`)).toBeGreaterThan(input.indexOf("## New input"));
+    expect(logs.some((l) => l.includes("session s-lost could not be resumed"))).toBe(true);
+
+    // Only the first input after the replacement carries it.
+    send("And where?");
+    await settled(2);
+    expect(turns[1]?.input).not.toContain("## New input");
   });
 
   it("keeps the warm session when the idle was short", async () => {

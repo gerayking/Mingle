@@ -286,24 +286,29 @@ export function imessageChannel(options: IMessageOptions = {}): Channel {
 
       /**
        * The newest message this account sent in a chat after `after`, to learn a sent message's id,
-       * and the address it went out from.
+       * and the address it went out from. Without a chat, in whichever chat it landed.
        */
-      const findSent = async (chatGuid: string, after: number): Promise<string | undefined> => {
+      const findSent = async (
+        chatGuid: string | undefined,
+        after: number,
+      ): Promise<{ guid: string; chat: string } | undefined> => {
         const deadline = now() + sentLookupMs;
         while (!closed) {
           try {
             const row = db
               .prepare(
-                `SELECT m.guid AS guid, m.destination_caller_id AS sender FROM message m
+                `SELECT m.guid AS guid, c.guid AS chat, m.destination_caller_id AS sender FROM message m
                  JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
                  JOIN chat c ON c.ROWID = cmj.chat_id
-                 WHERE c.guid = ? AND m.is_from_me = 1 AND m.ROWID > ?
+                 WHERE (? IS NULL OR c.guid = ?) AND m.is_from_me = 1 AND m.ROWID > ?
                  ORDER BY m.ROWID DESC LIMIT 1`,
               )
-              .get(chatGuid, after) as { guid: string; sender: string | null } | undefined;
+              .get(chatGuid ?? null, chatGuid ?? null, after) as
+              | { guid: string; chat: string; sender: string | null }
+              | undefined;
             if (row) {
-              if (row.sender) sendsFrom.set(chatGuid, lower(row.sender));
-              return row.guid;
+              if (row.sender) sendsFrom.set(row.chat, lower(row.sender));
+              return { guid: row.guid, chat: row.chat };
             }
           } catch {}
           if (now() >= deadline) return undefined;
@@ -352,7 +357,7 @@ export function imessageChannel(options: IMessageOptions = {}): Channel {
           } catch (error) {
             return withTextSent(sendFailure(error), textId);
           }
-          const id = await findSent(chatGuid, before);
+          const id = (await findSent(chatGuid, before))?.guid;
           // Messages accepted it; the database may lag. A local id keeps the record without a guid.
           return {
             kind: "sent",
@@ -369,11 +374,11 @@ export function imessageChannel(options: IMessageOptions = {}): Channel {
         },
 
         async messageUser(userId: string, text: string) {
-          if (lastChat) {
-            const before = maxRow();
-            await runScript(SEND_TEXT_SCRIPT, [outgoing(text), lastChat], 30_000);
-            await findSent(lastChat, before);
-          } else await runScript(SEND_TO_HANDLE_SCRIPT, [outgoing(text), userId], 30_000);
+          const before = maxRow();
+          if (lastChat) await runScript(SEND_TEXT_SCRIPT, [outgoing(text), lastChat], 30_000);
+          else await runScript(SEND_TO_HANDLE_SCRIPT, [outgoing(text), userId], 30_000);
+          const sent = await findSent(lastChat, before);
+          return sent && { chat: sent.chat, platformId: sent.guid };
         },
 
         async listMembers() {
